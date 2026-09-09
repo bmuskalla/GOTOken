@@ -1,0 +1,73 @@
+' model.bm - loading weights.bin. Included at the bottom of gotoken.bas.
+
+' ---------------------------------------------------------------------------
+' LoadModel: read the header, size the array, slurp every float.
+' Equivalent to run.c read_checkpoint + memory_map_weights.
+' ---------------------------------------------------------------------------
+SUB LoadModel (path AS STRING)
+    DIM f AS LONG, fileBytes AS _INTEGER64
+    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
+    f = FREEFILE
+    OPEN path FOR BINARY AS #f
+    fileBytes = LOF(f)
+    IF fileBytes < HEADER_BYTES THEN Fail "file too small: " + path
+
+    GET #f, , cfg ' the whole 48-byte record in one read
+    IF cfg.magic <> MAGIC THEN Fail "bad magic " + STR$(cfg.magic) + " (not a GOTOken weights file, or wrong endianness)"
+    IF cfg.version <> VERSION THEN Fail "unsupported version " + STR$(cfg.version)
+
+    headDim = cfg.modelDim \ cfg.nHeads
+    kvDim = cfg.nKvHeads * headDim
+    kvMul = cfg.nHeads \ cfg.nKvHeads
+
+    MapWeights
+    IF fileBytes <> HEADER_BYTES + 4 * CDBL(nParams) THEN
+        Fail "size mismatch: header implies " + STR$(HEADER_BYTES + 4 * CDBL(nParams)) + " bytes, file has " + STR$(fileBytes)
+    END IF
+
+    ' One GET on an array reads the whole array: nParams * 4 bytes straight
+    ' from the file into memory. SINGLE is IEEE 754 fp32 and the file is
+    ' little-endian fp32, so on any little-endian CPU this is byte-exact.
+    REDIM w(0 TO nParams - 1) AS SINGLE
+    GET #f, HEADER_BYTES + 1, w()
+    IF LOC(f) <> fileBytes THEN Fail "short read: " + STR$(LOC(f)) + " of " + STR$(fileBytes)
+    CLOSE #f
+END SUB
+
+' ---------------------------------------------------------------------------
+' MapWeights: walk the blob order from FORMAT.md, assigning each tensor its
+' start offset. This is memory_map_weights from run.c with pointer bumps
+' replaced by integer bumps. Blobs are interleaved per layer.
+' ---------------------------------------------------------------------------
+SUB MapWeights
+    DIM p AS LONG, l AS LONG
+    DIM d AS LONG, hd AS LONG, kv AS LONG
+    d = cfg.modelDim: hd = cfg.hiddenDim: kv = kvDim
+
+    REDIM offRmsAtt(0 TO cfg.nLayers - 1) AS LONG, offWq(0 TO cfg.nLayers - 1) AS LONG
+    REDIM offWk(0 TO cfg.nLayers - 1) AS LONG, offWv(0 TO cfg.nLayers - 1) AS LONG
+    REDIM offWo(0 TO cfg.nLayers - 1) AS LONG, offRmsFfn(0 TO cfg.nLayers - 1) AS LONG
+    REDIM offW1(0 TO cfg.nLayers - 1) AS LONG, offW2(0 TO cfg.nLayers - 1) AS LONG
+    REDIM offW3(0 TO cfg.nLayers - 1) AS LONG
+
+    p = 0
+    offTokenEmbedding = p: p = p + cfg.vocabSize * d
+    FOR l = 0 TO cfg.nLayers - 1
+        offRmsAtt(l) = p: p = p + d
+        offWq(l) = p: p = p + d * d '       [dim, dim]
+        offWk(l) = p: p = p + kv * d '      [kv_dim, dim]
+        offWv(l) = p: p = p + kv * d '      [kv_dim, dim]
+        offWo(l) = p: p = p + d * d '       [dim, dim]
+        offRmsFfn(l) = p: p = p + d
+        offW1(l) = p: p = p + hd * d '      gate [hidden, dim]
+        offW2(l) = p: p = p + d * hd '      down [dim, hidden]
+        offW3(l) = p: p = p + hd * d '      up   [hidden, dim]
+    NEXT
+    offRmsFinal = p: p = p + d
+    IF cfg.tied THEN
+        offWcls = offTokenEmbedding ' tied: the output head IS the embedding table
+    ELSE
+        offWcls = p: p = p + cfg.vocabSize * d
+    END IF
+    nParams = p
+END SUB

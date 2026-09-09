@@ -1,0 +1,18 @@
+' util.bm - small helpers.
+
+' The 4 bytes of a SINGLE as stored in memory (little-endian), for byte-exact
+' comparison with the export script's printout.
+FUNCTION FloatHex$ (v AS SINGLE)
+    DIM s AS STRING, i AS LONG, h AS STRING
+    s = MKS$(v)
+    h = ""
+    FOR i = 1 TO 4
+        h = h + RIGHT$("0" + LCASE$(HEX$(ASC(MID$(s, i, 1)))), 2)
+    NEXT
+    FloatHex$ = h
+END FUNCTION
+
+SUB Fail (msg AS STRING)
+    PRINT "error: "; msg
+    SYSTEM
+END SUB

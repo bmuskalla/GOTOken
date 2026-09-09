@@ -8,3 +8,4 @@ __pycache__/
 *.exe
 *.o
 build/
+.ipynb_checkpoints/

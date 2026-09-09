@@ -1,0 +1,23 @@
+' kernels.bm - the numeric building blocks. Each one mirrors a function in run.c.
+
+' ---------------------------------------------------------------------------
+' MatMul: xout(d) = W(d, n) * x(n), where W starts at w(woff) and is stored
+' row-major [d, n]. Same signature as run.c's matmul(xout, x, w, n, d) with
+' the float* replaced by an offset into w().
+'
+' By FLOPs this loop is essentially the entire inference engine. The inner
+' loop walks w() contiguously: row i of W is the n floats starting at
+' woff + i * n. Formal verification against Python on fixed inputs, and the
+' question of what "match" means for fp32 sums, is step 3.
+' ---------------------------------------------------------------------------
+SUB MatMul (xout() AS SINGLE, x() AS SINGLE, woff AS LONG, n AS LONG, d AS LONG)
+    DIM i AS LONG, j AS LONG, rowStart AS LONG, acc AS SINGLE
+    FOR i = 0 TO d - 1
+        rowStart = woff + i * n
+        acc = 0
+        FOR j = 0 TO n - 1
+            acc = acc + w(rowStart + j) * x(j)
+        NEXT
+        xout(i) = acc
+    NEXT
+END SUB

@@ -1,0 +1,32 @@
+' forward.bm - the forward pass. Grows one piece per step until it is run.c's
+' forward(). Step 2: embedding lookup and the output head, no transformer.
+
+SUB AllocRunState
+    REDIM x(0 TO cfg.modelDim - 1) AS SINGLE
+    REDIM logits(0 TO cfg.vocabSize - 1) AS SINGLE
+END SUB
+
+' ---------------------------------------------------------------------------
+' Embed: x = token_embedding[token]. The embedding table is [vocab, dim], so
+' the row for a token is the dim floats starting at token * dim. In run.c:
+'     float* content_row = w->token_embedding_table + token * dim;
+'     memcpy(x, content_row, dim*sizeof(*x));
+' ---------------------------------------------------------------------------
+SUB Embed (token AS LONG)
+    DIM i AS LONG, rowStart AS LONG
+    IF token < 0 OR token >= cfg.vocabSize THEN Fail "token id out of range: " + STR$(token)
+    rowStart = offTokenEmbedding + token * cfg.modelDim
+    FOR i = 0 TO cfg.modelDim - 1
+        x(i) = w(rowStart + i)
+    NEXT
+END SUB
+
+' ---------------------------------------------------------------------------
+' Classify: logits = wcls * x. The last line of run.c's forward():
+'     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+' With tied embeddings wcls is the embedding table itself, so each logit is
+' the dot product of x with one token's embedding row.
+' ---------------------------------------------------------------------------
+SUB Classify
+    MatMul logits(), x(), offWcls, cfg.modelDim, cfg.vocabSize
+END SUB

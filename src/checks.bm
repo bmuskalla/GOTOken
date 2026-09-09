@@ -1,0 +1,56 @@
+' checks.bm - checkpoint printers. Each step's numbers, in a fixed format the
+' Python oracle (export/oracle.py) can parse and compare.
+
+SUB PrintModelInfo
+    PRINT "weights.bin header"
+    PRINT "  magic        "; cfg.magic
+    PRINT "  version      "; cfg.version
+    PRINT "  dim          "; cfg.modelDim
+    PRINT "  hidden_dim   "; cfg.hiddenDim
+    PRINT "  n_layers     "; cfg.nLayers
+    PRINT "  n_heads      "; cfg.nHeads
+    PRINT "  n_kv_heads   "; cfg.nKvHeads
+    PRINT "  vocab_size   "; cfg.vocabSize
+    PRINT "  seq_len      "; cfg.seqLen
+    PRINT "  tied         "; cfg.tied
+    PRINT "  rope_theta   "; cfg.ropeTheta
+    PRINT "  rms_norm_eps "; cfg.rmsNormEps
+    PRINT "  derived: head_dim ="; headDim; " kv_dim ="; kvDim; " kv_mul ="; kvMul
+END SUB
+
+' Step 1: first and last five floats of the file, with raw bytes.
+SUB PrintWeightCheck
+    DIM i AS LONG
+    PRINT "first 5 floats of token_embedding (w(offTokenEmbedding + i)):"
+    FOR i = 0 TO 4
+        PRINT "  ["; i; "] "; CDBL(w(offTokenEmbedding + i)); "  hex "; FloatHex$(w(offTokenEmbedding + i))
+    NEXT
+    PRINT "last 5 floats of the file (tail of rms_final, w(nParams - 5 + i)):"
+    FOR i = 0 TO 4
+        PRINT "  ["; i; "] "; CDBL(w(nParams - 5 + i)); "  hex "; FloatHex$(w(nParams - 5 + i))
+    NEXT
+END SUB
+
+' Step 2: the first few logits verbatim, then the k largest.
+' Format: "logit <id> <value>" and "top <rank> id <id> logit <value>".
+SUB PrintLogits (k AS LONG)
+    DIM i AS LONG, r AS LONG, best AS LONG
+    REDIM taken(0 TO cfg.vocabSize - 1) AS _BYTE
+    FOR i = 0 TO 4
+        PRINT "logit"; i; logits(i)
+    NEXT
+    FOR r = 1 TO k
+        best = -1
+        FOR i = 0 TO cfg.vocabSize - 1
+            IF taken(i) = 0 THEN
+                IF best < 0 THEN
+                    best = i
+                ELSEIF logits(i) > logits(best) THEN
+                    best = i
+                END IF
+            END IF
+        NEXT
+        taken(best) = 1
+        PRINT "top"; r; " id"; best; " logit"; logits(best)
+    NEXT
+END SUB

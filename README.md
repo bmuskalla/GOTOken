@@ -10,11 +10,28 @@ before the next one starts.
 
 ## Layout
 
-    export/        Python: turns the HF checkpoint into flat binaries
-    model/         weights.bin + tokenizer.bin (generated, not committed)
-    FORMAT.md      exact byte layout of both binaries
-    gotoken.bas    the engine, one file, growing step by step
-    build.sh       compiles gotoken.bas with QB64 into build/gotoken
+    export/export.py    Python: turns the HF checkpoint into flat binaries
+    export/oracle.py    Python: reference values per step + comparison with the engine
+    export/oracle.ipynb notebook front-end over oracle.py
+    model/              weights.bin + tokenizer.bin (generated, not committed)
+    FORMAT.md           exact byte layout of both binaries
+    gotoken.bas         the engine's main program
+    src/*.bi            declarations (TYPEs, CONSTs, shared arrays)
+    src/*.bm            subs and functions
+    build.sh            compiles gotoken.bas with QB64 into build/gotoken
+
+QB64 has no modules, only textual `$INCLUDE`. Declarations must precede the
+main program and subs must follow it, hence the `.bi` includes at the top of
+`gotoken.bas` and the `.bm` includes at the bottom. Include paths resolve
+relative to the including file.
+
+    src/model.bi    Config TYPE, the flat weight array w(), per-tensor offsets
+    src/model.bm    LoadModel, MapWeights
+    src/state.bi    activations of the current forward pass (run.c RunState)
+    src/kernels.bm  MatMul (RMSNorm, softmax, ... arrive with their steps)
+    src/forward.bm  Embed, Classify (grows into run.c's forward)
+    src/checks.bm   checkpoint printers in a format oracle.py parses
+    src/util.bm     FloatHex$, Fail
 
 ## Step 0: export the model
 
@@ -74,13 +91,35 @@ offset per tensor. Element `(o, i)` of a `[out, in]` matrix at offset `p` is
 `w(p + o * in + i)`, which is the layout the matmul in step 3 reads
 contiguously.
 
+## Step 2: embedding row to logits, no transformer
+
+```bash
+./build.sh && ./build/gotoken 2644
+cd export && .venv/bin/python oracle.py step2 --token 2644 --basic
+```
+
+`gotoken <token_id>` copies that token's embedding row into `x()` and runs the
+output head: `logits = wcls * x`, one dot product per vocab entry. The header
+says `tied = 1`, so `wcls` is the embedding table itself, and every logit is
+"how similar is this vocab row to the input row". Without a single
+transformer layer the top-5 for ` cat` (id 2644) is ` cat`, `cat`, `cats`,
+`Cat`, `<filename>`. The transformer's whole job, from step 4 on, is to turn
+`x` from "this token" into "the next token".
+
+The oracle computes the same dot products in float64 and compares. BASIC
+accumulates 576 fp32 products in sequence and lands within about 1e-6 of the
+float64 answer; what tolerance is acceptable and why exact match is impossible
+is the topic of step 3, where the matmul gets tested in isolation.
+
+`oracle.py encode "some text"` prints token ids to pick test tokens with.
+
 ## Plan
 
 | step | what | checkpoint |
 |-----:|------|------------|
-| 0 | Python export script | header + first 5 embedding floats printed |
-| 1 | BASIC loader | first 5 floats match byte-exact |
-| 2 | embedding lookup + tied output head | logits match Python for one token |
+| 0 | Python export script | header + first 5 embedding floats printed (done) |
+| 1 | BASIC loader | first 5 floats match byte-exact (done) |
+| 2 | embedding lookup + tied output head | logits match Python for one token (done) |
 | 3 | matmul + RMSNorm kernels | match Python within ~1e-5 |
 | 4 | one transformer layer at position 0 | layer-0 output matches a forward hook |
 | 5 | full forward + greedy decode | token-for-token match with `transformers` |
