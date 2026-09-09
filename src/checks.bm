@@ -54,3 +54,42 @@ SUB PrintLogits (k AS LONG)
         PRINT "top"; r; " id"; best; " logit"; logits(best)
     NEXT
 END SUB
+
+' Step 3: each kernel once, in isolation, on real data from layer 0.
+' Input is the (already verified) embedding row of a token. Every output
+' element is printed with its raw bits so the oracle can compare exactly.
+SUB KernelCheck (token AS LONG)
+    DIM t0 AS DOUBLE, d AS LONG
+    d = cfg.modelDim
+    Embed token
+    PrintVec "x", x(), d
+
+    t0 = TIMER(0.001)
+    RmsNorm xb(), x(), offRmsAtt(0), d
+    PRINT "time rmsnorm"; TIMER(0.001) - t0
+    PrintVec "rmsnorm", xb(), d
+
+    t0 = TIMER(0.001)
+    MatMul q(), xb(), offWq(0), d, d
+    PRINT "time wq"; TIMER(0.001) - t0
+    PrintVec "wq", q(), d
+
+    t0 = TIMER(0.001)
+    MatMul k(), xb(), offWk(0), d, kvDim
+    PRINT "time wk"; TIMER(0.001) - t0
+    PrintVec "wk", k(), kvDim
+
+    t0 = TIMER(0.001)
+    MatMul hb(), xb(), offW1(0), d, cfg.hiddenDim
+    PRINT "time w1"; TIMER(0.001) - t0
+    PrintVec "w1", hb(), cfg.hiddenDim
+END SUB
+
+' Format: "vec <name> <n>" then n lines "<i> <value> <hex>".
+SUB PrintVec (label AS STRING, v() AS SINGLE, n AS LONG)
+    DIM i AS LONG
+    PRINT "vec "; label; n
+    FOR i = 0 TO n - 1
+        PRINT i; v(i); " "; FloatHex$(v(i))
+    NEXT
+END SUB

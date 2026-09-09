@@ -3,6 +3,10 @@
 
 SUB AllocRunState
     REDIM x(0 TO cfg.modelDim - 1) AS SINGLE
+    REDIM xb(0 TO cfg.modelDim - 1) AS SINGLE
+    REDIM q(0 TO cfg.modelDim - 1) AS SINGLE
+    REDIM k(0 TO kvDim - 1) AS SINGLE
+    REDIM hb(0 TO cfg.hiddenDim - 1) AS SINGLE
     REDIM logits(0 TO cfg.vocabSize - 1) AS SINGLE
 END SUB
 

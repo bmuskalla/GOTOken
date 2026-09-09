@@ -21,3 +21,26 @@ SUB MatMul (xout() AS SINGLE, x() AS SINGLE, woff AS LONG, n AS LONG, d AS LONG)
         xout(i) = acc
     NEXT
 END SUB
+
+' ---------------------------------------------------------------------------
+' RmsNorm: o = weight * x / rms(x), with rms(x) = sqrt(mean(x^2) + eps).
+' run.c's rmsnorm(o, x, weight, size), eps taken from the header instead of
+' being hardcoded. The weight is a per-element gain, [size] floats at woff.
+'
+' Pre-norm transformers apply this before attention and before the FFN so
+' that whatever magnitude the residual stream has drifted to, the sublayer
+' sees unit-scale input. No mean subtraction, unlike LayerNorm.
+' ---------------------------------------------------------------------------
+SUB RmsNorm (o() AS SINGLE, x() AS SINGLE, woff AS LONG, size AS LONG)
+    DIM j AS LONG, ss AS SINGLE
+    ss = 0
+    FOR j = 0 TO size - 1
+        ss = ss + x(j) * x(j)
+    NEXT
+    ss = ss / size
+    ss = ss + cfg.rmsNormEps
+    ss = 1 / SQR(ss)
+    FOR j = 0 TO size - 1
+        o(j) = w(woff + j) * (ss * x(j))
+    NEXT
+END SUB
