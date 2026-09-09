@@ -1,0 +1,261 @@
+' tokenizer.bm - byte-level BPE, the way SmolLM2's (GPT-2 style) tokenizer
+' does it, using nothing but tokenizer.bin. export/bpe_ref.py is the same
+' algorithm in Python, validated against HuggingFace; keep the two in sync.
+'
+' encode(text):
+'   1. PreTokenize: split into chunks with the GPT-2 regex
+'        's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+'      written out as a scanner. Merges never cross a chunk boundary.
+'   2. EncodeChunk: one token per byte, then repeatedly merge the adjacent
+'      pair whose concatenation is a vocab token with the best score
+'      (llama2.c's loop; score = -merge_rank, so lowest rank merges first).
+'   3. bytes with no token (21 of them) are dropped, as HuggingFace does.
+
+SUB LoadTokenizer (path AS STRING)
+    DIM f AS LONG, i AS LONG, n AS LONG, s AS STRING
+    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
+    f = FREEFILE
+    OPEN path FOR BINARY AS #f
+    GET #f, , tokVocabSize
+    GET #f, , tokMaxLen
+    REDIM tokStr(0 TO tokVocabSize - 1) AS STRING
+    REDIM tokScore(0 TO tokVocabSize - 1) AS SINGLE
+    FOR i = 0 TO tokVocabSize - 1
+        GET #f, , tokScore(i)
+        GET #f, , n
+        s = SPACE$(n) ' GET into a string reads LEN(s) bytes
+        IF n > 0 THEN GET #f, , s
+        tokStr(i) = s
+    NEXT
+    GET #f, , nLetterRanges
+    REDIM letterLo(0 TO nLetterRanges - 1) AS LONG, letterHi(0 TO nLetterRanges - 1) AS LONG
+    FOR i = 0 TO nLetterRanges - 1
+        GET #f, , letterLo(i): GET #f, , letterHi(i)
+    NEXT
+    GET #f, , nNumberRanges
+    REDIM numberLo(0 TO nNumberRanges - 1) AS LONG, numberHi(0 TO nNumberRanges - 1) AS LONG
+    FOR i = 0 TO nNumberRanges - 1
+        GET #f, , numberLo(i): GET #f, , numberHi(i)
+    NEXT
+    GET #f, , nSpaceRanges
+    REDIM spaceLo(0 TO nSpaceRanges - 1) AS LONG, spaceHi(0 TO nSpaceRanges - 1) AS LONG
+    FOR i = 0 TO nSpaceRanges - 1
+        GET #f, , spaceLo(i): GET #f, , spaceHi(i)
+    NEXT
+    IF LOC(f) <> LOF(f) THEN Fail "tokenizer.bin: " + STR$(LOF(f) - LOC(f)) + " trailing bytes"
+    CLOSE #f
+
+    ' lookup tables: byte -> id, and string -> id
+    FOR i = 0 TO 255
+        byteId(i) = -1
+    NEXT
+    FOR i = 0 TO HASH_MASK
+        hashId(i) = -1
+    NEXT
+    FOR i = 0 TO tokVocabSize - 1
+        IF LEN(tokStr(i)) = 1 THEN byteId(ASC(tokStr(i))) = i
+        HashInsert tokStr(i), i
+    NEXT
+END SUB
+
+' ---------------------------------------------------------------------------
+' string -> id hash table (FNV-1a, linear probing)
+' ---------------------------------------------------------------------------
+FUNCTION HashSlot& (s AS STRING)
+    DIM h AS _UNSIGNED _INTEGER64, i AS LONG
+    h = 2166136261
+    FOR i = 1 TO LEN(s)
+        h = (h XOR ASC(s, i)) * 16777619
+        h = h AND &HFFFFFFFF&&
+    NEXT
+    HashSlot& = h AND HASH_MASK
+END FUNCTION
+
+SUB HashInsert (s AS STRING, id AS LONG)
+    DIM slot AS LONG
+    slot = HashSlot&(s)
+    WHILE hashId(slot) >= 0
+        IF tokStr(hashId(slot)) = s THEN Fail "duplicate token " + s
+        slot = (slot + 1) AND HASH_MASK
+    WEND
+    hashId(slot) = id
+END SUB
+
+' id of the token whose bytes are exactly s, or -1
+FUNCTION LookupId& (s AS STRING)
+    DIM slot AS LONG
+    slot = HashSlot&(s)
+    WHILE hashId(slot) >= 0
+        IF tokStr(hashId(slot)) = s THEN LookupId& = hashId(slot): EXIT FUNCTION
+        slot = (slot + 1) AND HASH_MASK
+    WEND
+    LookupId& = -1
+END FUNCTION
+
+' ---------------------------------------------------------------------------
+' UTF-8 and character classes
+' ---------------------------------------------------------------------------
+' Decode the codepoint starting at byte i of s. Returns its byte length and
+' sets cp. Malformed input is treated as one byte per codepoint.
+FUNCTION Utf8Next& (s AS STRING, i AS LONG, cp AS LONG)
+    DIM b AS LONG, n AS LONG, j AS LONG
+    b = ASC(s, i)
+    IF b < 128 THEN
+        cp = b: n = 1
+    ELSEIF b >= 240 THEN
+        cp = b AND 7: n = 4
+    ELSEIF b >= 224 THEN
+        cp = b AND 15: n = 3
+    ELSEIF b >= 192 THEN
+        cp = b AND 31: n = 2
+    ELSE
+        cp = b: n = 1 ' stray continuation byte
+    END IF
+    IF i + n - 1 > LEN(s) THEN cp = b: n = 1
+    FOR j = 1 TO n - 1
+        cp = cp * 64 + (ASC(s, i + j) AND 63)
+    NEXT
+    Utf8Next& = n
+END FUNCTION
+
+' binary search over sorted inclusive ranges
+FUNCTION InRanges& (cp AS LONG, lo() AS LONG, hi() AS LONG, n AS LONG)
+    DIM a AS LONG, b AS LONG, m AS LONG
+    a = 0: b = n - 1
+    WHILE a <= b
+        m = (a + b) \ 2
+        IF cp < lo(m) THEN
+            b = m - 1
+        ELSEIF cp > hi(m) THEN
+            a = m + 1
+        ELSE
+            InRanges& = -1: EXIT FUNCTION
+        END IF
+    WEND
+    InRanges& = 0
+END FUNCTION
+
+FUNCTION CharClass& (cp AS LONG)
+    IF InRanges&(cp, spaceLo(), spaceHi(), nSpaceRanges) THEN CharClass& = CLS_SPACE: EXIT FUNCTION
+    IF InRanges&(cp, letterLo(), letterHi(), nLetterRanges) THEN CharClass& = CLS_LETTER: EXIT FUNCTION
+    IF InRanges&(cp, numberLo(), numberHi(), nNumberRanges) THEN CharClass& = CLS_NUMBER: EXIT FUNCTION
+    CharClass& = CLS_OTHER
+END FUNCTION
+
+' ---------------------------------------------------------------------------
+' 1. pre-tokenizer: text -> chunks (byte offsets into text)
+' ---------------------------------------------------------------------------
+' Fills chunkStart(c), chunkLen(c) for c = 0..nChunks-1.
+SUB PreTokenize (text AS STRING, chunkStart() AS LONG, chunkLen() AS LONG, nChunks AS LONG)
+    DIM n AS LONG, i AS LONG, j AS LONG, e AS LONG, k AS LONG, c AS LONG
+    ' decode once: codepoint cp(k), its class cpClass(k), and byte offset cpPos(k); cpPos(n) = end
+    n = 0
+    REDIM cp(0 TO LEN(text)) AS LONG, cpClass(0 TO LEN(text)) AS LONG, cpPos(0 TO LEN(text)) AS LONG
+    i = 1
+    WHILE i <= LEN(text)
+        cpPos(n) = i
+        i = i + Utf8Next&(text, i, cp(n))
+        cpClass(n) = CharClass&(cp(n))
+        n = n + 1
+    WEND
+    cpPos(n) = LEN(text) + 1
+
+    REDIM chunkStart(0 TO n) AS LONG, chunkLen(0 TO n) AS LONG
+    nChunks = 0
+    i = 0
+    WHILE i < n
+        e = -1
+        ' 's|'t|'re|'ve|'m|'ll|'d  (lowercase only, tried first)
+        IF cp(i) = 39 AND i + 1 < n THEN
+            c = cp(i + 1)
+            IF c = 115 OR c = 116 OR c = 109 OR c = 100 THEN ' s t m d
+                e = i + 2
+            ELSEIF i + 2 < n THEN
+                IF (c = 114 AND cp(i + 2) = 101) OR (c = 118 AND cp(i + 2) = 101) OR (c = 108 AND cp(i + 2) = 108) THEN e = i + 3 ' re ve ll
+            END IF
+        END IF
+        ' ' ?\p{L}+' | ' ?\p{N}+' | ' ?[^\s\p{L}\p{N}]+'   (optional literal space, then a run of one class)
+        IF e < 0 THEN
+            j = i
+            IF cp(i) = 32 THEN j = i + 1
+            IF j < n THEN
+                k = cpClass(j)
+                IF k <> CLS_SPACE THEN
+                    e = j
+                    WHILE e < n AND cpClass(e) = k
+                        e = e + 1
+                    WEND
+                END IF
+            END IF
+        END IF
+        ' '\s+(?!\S)' | '\s+'   (a run of whitespace; leave the last one for the next word)
+        IF e < 0 THEN
+            IF cpClass(i) = CLS_SPACE THEN
+                e = i
+                WHILE e < n AND cpClass(e) = CLS_SPACE
+                    e = e + 1
+                WEND
+                IF e < n AND e - i > 1 THEN e = e - 1
+            END IF
+        END IF
+        IF e < 0 THEN Fail "pre-tokenizer stuck at codepoint" + STR$(cp(i))
+        chunkStart(nChunks) = cpPos(i)
+        chunkLen(nChunks) = cpPos(e) - cpPos(i)
+        nChunks = nChunks + 1
+        i = e
+    WEND
+END SUB
+
+' ---------------------------------------------------------------------------
+' 2. byte-pair merging within one chunk. Appends ids to ids(), advances nIds.
+' ---------------------------------------------------------------------------
+SUB EncodeChunk (chunk AS STRING, ids() AS LONG, nIds AS LONG)
+    DIM i AS LONG, m AS LONG, id AS LONG, best AS SINGLE, bestId AS LONG, bestAt AS LONG
+    REDIM part(0 TO LEN(chunk)) AS LONG
+    m = 0
+    FOR i = 1 TO LEN(chunk) ' one token per byte; bytes without a token are dropped
+        id = byteId(ASC(chunk, i))
+        IF id >= 0 THEN part(m) = id: m = m + 1
+    NEXT
+    WHILE m > 1
+        best = -1E+31: bestAt = -1
+        FOR i = 0 TO m - 2
+            id = LookupId&(tokStr(part(i)) + tokStr(part(i + 1)))
+            IF id >= 0 THEN
+                IF tokScore(id) > best THEN best = tokScore(id): bestId = id: bestAt = i
+            END IF
+        NEXT
+        IF bestAt < 0 THEN EXIT WHILE ' nothing left to merge
+        part(bestAt) = bestId
+        FOR i = bestAt + 1 TO m - 2
+            part(i) = part(i + 1)
+        NEXT
+        m = m - 1
+    WEND
+    FOR i = 0 TO m - 1
+        ids(nIds) = part(i)
+        nIds = nIds + 1
+    NEXT
+END SUB
+
+' text -> ids(0..nIds-1). ids() is resized to fit.
+SUB Encode (text AS STRING, ids() AS LONG, nIds AS LONG)
+    DIM c AS LONG, nChunks AS LONG
+    REDIM chunkStart(0 TO 0) AS LONG, chunkLen(0 TO 0) AS LONG
+    REDIM ids(0 TO LEN(text)) AS LONG ' at most one token per byte
+    nIds = 0
+    PreTokenize text, chunkStart(), chunkLen(), nChunks
+    FOR c = 0 TO nChunks - 1
+        EncodeChunk MID$(text, chunkStart(c), chunkLen(c)), ids(), nIds
+    NEXT
+END SUB
+
+FUNCTION Decode$ (ids() AS LONG, nIds AS LONG)
+    DIM i AS LONG, s AS STRING
+    s = ""
+    FOR i = 0 TO nIds - 1
+        IF ids(i) < 0 OR ids(i) >= tokVocabSize THEN Fail "token id out of range: " + STR$(ids(i))
+        s = s + tokStr(ids(i))
+    NEXT
+    Decode$ = s
+END FUNCTION

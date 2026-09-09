@@ -227,6 +227,34 @@ def bytes_to_unicode() -> dict[int, str]:
     return dict(zip(bs, (chr(c) for c in cs)))
 
 
+def unicode_class_ranges() -> dict[str, list[tuple[int, int]]]:
+    """Codepoint ranges for the three character classes the GPT-2 regex uses:
+    letters (L*), numbers (N*), and whitespace (the Unicode White_Space
+    property, which is what the Rust regex crate's \s means)."""
+    import unicodedata
+
+    def ranges_where(pred) -> list[tuple[int, int]]:
+        out, start = [], None
+        for cp in range(0x110000):
+            if pred(cp):
+                if start is None:
+                    start = cp
+            elif start is not None:
+                out.append((start, cp - 1))
+                start = None
+        if start is not None:
+            out.append((start, 0x10FFFF))
+        return out
+
+    white_space = set(range(0x09, 0x0E)) | {0x20, 0x85, 0xA0, 0x1680} | set(range(0x2000, 0x200B)) | \
+        {0x2028, 0x2029, 0x202F, 0x205F, 0x3000}
+    return {
+        "L": ranges_where(lambda cp: unicodedata.category(chr(cp)).startswith("L")),
+        "N": ranges_where(lambda cp: unicodedata.category(chr(cp)).startswith("N")),
+        "WS": ranges_where(lambda cp: cp in white_space),
+    }
+
+
 def export_tokenizer(model_dir: Path, c: dict, out_path: Path) -> list[bytes]:
     tj = json.loads((model_dir / "tokenizer.json").read_text())
     assert tj["model"]["type"] == "BPE"
@@ -262,6 +290,14 @@ def export_tokenizer(model_dir: Path, c: dict, out_path: Path) -> list[bytes]:
         for t, sc in zip(tokens, scores):
             out.write(struct.pack("<fi", float(sc), len(t)))
             out.write(t)
+        # The pre-tokenizer regex needs \p{L}, \p{N} and \s over all of Unicode.
+        # Ship them as sorted inclusive codepoint ranges so BASIC does a binary
+        # search instead of carrying a Unicode database.
+        for name, ranges in unicode_class_ranges().items():
+            out.write(struct.pack("<i", len(ranges)))
+            for lo, hi in ranges:
+                out.write(struct.pack("<ii", lo, hi))
+            print(f"  unicode class {name}: {len(ranges)} ranges")
 
     # Not every byte has a token: this vocab was trained on UTF-8 text, so bytes
     # that never occur in valid UTF-8 (0xC0, 0xC1, 0xF5..0xFF) and a few control

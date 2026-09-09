@@ -64,4 +64,9 @@ SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG, useCache AS LON
         n = n + 1
     NEXT
     PRINT "generated"; nSteps; "tokens with"; forwards; "forwards in"; TIMER(0.001) - tStart; "s"
+    REDIM genSeq(0 TO n - 1) AS LONG
+    FOR p = 0 TO n - 1
+        genSeq(p) = seq(p)
+    NEXT
+    genLen = n
 END SUB

@@ -12,6 +12,7 @@ before the next one starts.
 
     export/export.py    Python: turns the HF checkpoint into flat binaries
     export/oracle.py    Python: reference values per step + comparison with the engine
+    export/bpe_ref.py   Python: the tokenizer against tokenizer.bin only, validated vs HF
     export/oracle.ipynb notebook front-end over oracle.py
     model/              weights.bin + tokenizer.bin (generated, not committed)
     FORMAT.md           exact byte layout of both binaries
@@ -31,6 +32,7 @@ relative to the including file.
     src/kernels.bm  MatMul, RmsNorm, Softmax
     src/forward.bm  Embed, Rope, TransformerLayer, Forward, Classify
     src/generate.bm Generate (greedy decoding, with or without the KV cache), BestTwo
+    src/tokenizer.bi/.bm  LoadTokenizer, PreTokenize, Encode, Decode$
     src/checks.bm   checkpoint printers in a format oracle.py parses
     src/util.bm     FloatHex$, Fail
 
@@ -337,6 +339,65 @@ the weights, is what fills memory.
 **What it does not fix.** The one forward per token still takes 0.96 s,
 all of it in matmul against 538 MB of weights. That is step 9's problem.
 
+## Step 7: the tokenizer
+
+```bash
+./build.sh
+./build/gotoken encode "Hello world, I'm naïve 🚀 12345"
+./build/gotoken decode 19556 905 28
+./build/gotoken complete 8 "The capital of France is"
+cd export && .venv/bin/python bpe_ref.py            # Python reference vs HuggingFace
+cd export && .venv/bin/python oracle.py step7 --basic  # BASIC vs HuggingFace
+```
+
+| check                                          | result |
+|------------------------------------------------|--------|
+| Python reference vs HF, 60 edge cases + 2000 random strings | 2060/2060 |
+| BASIC vs HF, same corpus                        | 2060/2060, 0.07 s for all of them |
+| BASIC decode round trip                         | ok, including newlines and CJK |
+
+`complete <steps> "<text>"` closes the loop: text in, tokens, greedy
+decoding with the KV cache, text out. `The capital of France is` gives
+` the capital of the country.` which is what 135M parameters know.
+
+**How it was built.** The tokenizer was written twice on purpose. First
+`export/bpe_ref.py`, in Python but reading only `tokenizer.bin`, and
+validated against HuggingFace on the corpus until every string matched.
+Then `src/tokenizer.bm`, a line-by-line port. When the port disagreed with
+HuggingFace, the reference said whether the algorithm or the port was wrong.
+Neither did, on the first run, which is what writing it twice buys.
+
+**BPE mechanics.** `Encode` does two things. `PreTokenize` splits the text
+into chunks with the GPT-2 regex, written out as a scanner because BASIC
+has no regex engine: contractions (`'s`, `'re`, ...), an optional space
+followed by a run of letters, or numbers, or anything else, and runs of
+whitespace that leave their last space for the following word (`"a  b"` is
+`a`, ` `, ` b`). Merges never cross a chunk boundary, which is why ` cat`
+and `cat` are different tokens and why the space belongs to the word after
+it. `EncodeChunk` then starts from one token per byte and repeatedly merges
+the adjacent pair whose concatenation is a vocab entry with the best score.
+That is llama2.c's loop; the export made it equivalent to GPT-2's
+rank-ordered merges by setting `score = -rank`.
+
+**Byte level.** There is no unknown token. Every byte is a token, so any
+UTF-8 string tokenizes: `🚀` becomes a space-plus-byte token and three more
+byte tokens, and merges build multi-byte tokens like `ïve` from them. The
+price is that `\p{L}` and `\p{N}` in the regex are questions about
+codepoints, so the export ships 648 letter ranges, 134 number ranges and
+10 whitespace ranges, and the scanner decodes UTF-8 to ask them.
+
+**Why tokenization is the ugliest part of every stack.** Three things had
+to be discovered rather than read: the double newline before a word splits
+into two `\n` tokens (the regex's lookahead, not a bug); `tokenizer.json`
+declares a digit-splitting step that transformers 5 silently drops when
+loading, harmless only because no merge in this vocab involves a digit;
+and `\s` means the Unicode White_Space property, so U+00A0 is whitespace
+but U+200B is not. None of that is in any paper. The 21 bytes with no
+token, dropped silently, are the same kind of thing.
+
+**Reserved words this step:** `CLS`, `POS`. The engine-wide list is now
+`DIM`, `VAL`, `BASE`, `OFF`, `POS`, `CLS`.
+
 ## Plan
 
 | step | what | checkpoint |
@@ -348,6 +409,6 @@ all of it in matmul against 538 MB of weights. That is step 9's problem.
 | 4 | one transformer layer | layer-0 output matches a forward hook (done) |
 | 5 | full forward + greedy decode | token-for-token match with `transformers` (done) |
 | 6 | KV cache | same output, measurably faster (done) |
-| 7 | BPE tokenizer | round-trip matches Python tokenizer |
+| 7 | BPE tokenizer | round-trip matches Python tokenizer (done) |
 | 8 | sampler + REPL | temp 0 reproduces greedy |
 | 9 | int8 quantization (optional) | quality holds, faster |

@@ -14,6 +14,7 @@ Usage:
     python oracle.py step4 --tokens 504 2644 2643 --basic  # layer 0 over a sequence vs a forward hook
     python oracle.py step5 --tokens 504 2644 2643 --steps 8 --basic  # full forward + greedy decode
     python oracle.py step6 --tokens 504 2644 2643 --steps 8 --basic  # KV cache: same bits, timing curve
+    python oracle.py step7 --basic                        # tokenizer round trip vs HF on the corpus
 """
 
 import argparse
@@ -405,6 +406,55 @@ def compare_step6(model, tok, tokens: list[int], steps: int, long_steps: int = 2
 
 
 # --------------------------------------------------------------------------- #
+# step 7: the tokenizer, against HuggingFace on the whole test corpus
+# --------------------------------------------------------------------------- #
+def compare_step7(tok, n_random: int = 2000) -> bool:
+    import struct
+    import tempfile
+    from bpe_ref import Tokenizer as RefTokenizer, corpus, HAND
+
+    tests = corpus(n_random)
+    with tempfile.NamedTemporaryFile("wb", suffix=".bin", delete=False) as f:
+        f.write(struct.pack("<i", len(tests)))
+        for s_ in tests:
+            b = s_.encode("utf-8")
+            f.write(struct.pack("<i", len(b)) + b)
+        batch = f.name
+    text = run_basic("encode-batch", batch)
+    got = [[int(x) for x in line[4:].split()] for line in text.splitlines() if line.startswith("ids:")]
+    assert len(got) == len(tests), (len(got), len(tests))
+
+    ref = RefTokenizer()
+    bad = 0
+    for s_, ids in zip(tests, got):
+        hf = tok.encode(s_, add_special_tokens=False)
+        if ids != hf:
+            bad += 1
+            if bad <= 10:
+                print(f"  MISMATCH {s_!r}\n    basic {ids}\n    hf    {hf}\n    ref   {ref.encode(s_)}")
+    m = re.search(r"encoded\s+(\d+)\s+strings in\s+(\S+)", text)
+    print(f"\ntokenizer: BASIC vs HuggingFace on {len(tests)} strings "
+          f"({len(HAND)} hand-written, {n_random} random): {len(tests) - bad} match")
+    if m:
+        print(f"  BASIC encoded {m[1]} strings in {float(m[2].replace('D', 'E')):.2f}s")
+
+    # decode round trip through BASIC for a few strings with full byte coverage
+    ok = bad == 0
+    for s_ in HAND[:6]:
+        ids = tok.encode(s_, add_special_tokens=False)
+        out = run_basic("decode", *ids)
+        # everything after the label, minus PRINT's own newline (the text may contain newlines)
+        line = out.split("text: ", 1)[1] if "text: " in out else None
+        if line is not None and line.endswith("\n"):
+            line = line[:-1]
+        same = line == s_
+        ok &= same
+        print(f"  decode {s_!r:<50} {'ok' if same else 'MISMATCH: ' + repr(line)}")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -428,9 +478,16 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--long", type=int, default=24, help="length of the cached-only run")
     p.add_argument("--basic", action="store_true", help="run both generate modes and compare")
+    p = sub.add_parser("step7", help="tokenizer: BASIC encode/decode vs HuggingFace on the corpus")
+    p.add_argument("--random", type=int, default=2000)
+    p.add_argument("--basic", action="store_true", help="run build/gotoken encode-batch and compare")
     args = ap.parse_args()
 
     tok = load_tokenizer()
+    if args.cmd == "step7":
+        if not args.basic:
+            sys.exit("step7 compares the BASIC tokenizer; pass --basic (bpe_ref.py validates the Python reference)")
+        return 0 if compare_step7(tok, args.random) else 1
     if args.cmd == "encode":
         ids = tok.encode(args.text, add_special_tokens=False)
         for i in ids:

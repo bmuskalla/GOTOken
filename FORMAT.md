@@ -107,7 +107,18 @@ numerically on layer 0 every run.
         INT32  length
         BYTE[length] raw UTF-8 bytes of the token
 
-This is the llama2.c `tokenizer.bin` scheme with the vocab size prepended.
+    then three Unicode character classes, each as sorted inclusive
+    codepoint ranges:
+        INT32  count
+        INT32  lo, INT32 hi      (count times)
+    in the order  L (letters, Unicode L*: 648 ranges),
+                  N (numbers, N*: 134 ranges),
+                  WS (whitespace, the White_Space property: 10 ranges)
+
+This is the llama2.c `tokenizer.bin` scheme with the vocab size prepended,
+plus the class tables the GPT-2 pre-tokenizer regex needs for `\p{L}`,
+`\p{N}` and `\s`. Shipping them as ranges lets the engine classify a
+codepoint with a binary search instead of carrying a Unicode database.
 
 * Bytes are real bytes. The GPT-2 byte-to-unicode trick used inside
   `tokenizer.json` (space shown as `Ġ`, etc.) is undone at export.
@@ -119,6 +130,10 @@ This is the llama2.c `tokenizer.bin` scheme with the vocab size prepended.
   special tokens, ids 0 to 16) have `score = -1e30`. The encoder must never
   merge into them.
 * `<|endoftext|>` is id 0 and serves as both BOS and EOS.
+* The pre-tokenizer is the GPT-2 regex alone. `tokenizer.json` also lists
+  a `Digits(individual_digits)` step, but no merge rule and no multi-char
+  token contains a numeric character, so digits come out one token each
+  either way, and transformers 5 drops the step when loading.
 * 21 byte values have no token at all: `0x04 0x06 0x13 0x14 0x16 0x1d 0xc0
   0xc1 0xf1 0xf2 0xf5..0xff`. They cannot appear in the UTF-8 training data.
   HuggingFace drops such bytes silently; the byte fallback in step 7 does the

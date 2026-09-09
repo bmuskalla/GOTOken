@@ -19,3 +19,7 @@ REDIM SHARED logits(0 TO 0) AS SINGLE ' one score per vocab entry, [vocab]
 DIM SHARED maxSeq AS LONG
 REDIM SHARED keyCache(0 TO 0) AS SINGLE
 REDIM SHARED valueCache(0 TO 0) AS SINGLE
+
+' The token sequence of the last Generate call (prompt + generated).
+REDIM SHARED genSeq(0 TO 0) AS LONG
+DIM SHARED genLen AS LONG

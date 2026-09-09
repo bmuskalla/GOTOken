@@ -111,3 +111,22 @@ SUB LayerCheck (tokens() AS LONG, n AS LONG)
     PrintVec "k_rope", k(), kvDim
     PrintVec "layer0", x(), cfg.modelDim
 END SUB
+
+' Step 7: show the pre-tokenizer chunks and the ids for one string.
+SUB EncodeVerbose (text AS STRING)
+    DIM c AS LONG, i AS LONG, n AS LONG, nChunks AS LONG
+    REDIM chunkStart(0 TO 0) AS LONG, chunkLen(0 TO 0) AS LONG, ids(0 TO 0) AS LONG
+    PreTokenize text, chunkStart(), chunkLen(), nChunks
+    FOR c = 0 TO nChunks - 1
+        PRINT "chunk "; CHR$(34); MID$(text, chunkStart(c), chunkLen(c)); CHR$(34)
+    NEXT
+    Encode text, ids(), n
+    PRINT "ids:";
+    FOR i = 0 TO n - 1
+        PRINT ids(i);
+    NEXT
+    PRINT
+    FOR i = 0 TO n - 1
+        PRINT "  "; ids(i); " "; CHR$(34); tokStr(ids(i)); CHR$(34)
+    NEXT
+END SUB
