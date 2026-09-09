@@ -33,6 +33,7 @@ relative to the including file.
     src/forward.bm  Embed, Rope, TransformerLayer, Forward, Classify
     src/generate.bm Generate (greedy decoding, with or without the KV cache), BestTwo
     src/tokenizer.bi/.bm  LoadTokenizer, PreTokenize, Encode, Decode$
+    src/sampler.bi/.bm    InitSampler, Sample (temperature, top-k, top-p, xorshift64*)
     src/checks.bm   checkpoint printers in a format oracle.py parses
     src/util.bm     FloatHex$, Fail
 
@@ -398,6 +399,64 @@ token, dropped silently, are the same kind of thing.
 **Reserved words this step:** `CLS`, `POS`. The engine-wide list is now
 `DIM`, `VAL`, `BASE`, `OFF`, `POS`, `CLS`.
 
+## Step 8: the sampler and a REPL
+
+```bash
+./build.sh
+./build/gotoken repl                      # temperature 0.7, top-p 0.9, 64 tokens per line
+./build/gotoken repl 1.0 0.9 40 7         # temperature, top-p, top-k, seed
+./build/gotoken sample 8 0.8 0.9 0 42 6403 1980 253 655
+cd export && .venv/bin/python oracle.py step8 --tokens 6403 1980 253 655 --basic
+```
+
+In the REPL every line is a fresh prompt; `/temp 0.3`, `/topp 0.95`,
+`/topk 40`, `/seed 1`, `/steps 128` change settings, `/quit` leaves.
+Output streams token by token and stops at `<|endoftext|>`.
+
+| check | result |
+|---|---|
+| temperature 0 vs HF greedy | identical |
+| temperature 0.8, top-p 0.9, seed 42 vs the Python reference sampler | 8/8 tokens, coins identical to 7 digits |
+| temperature 1.0, top-k 40, seed 7 vs the reference sampler | 8/8 tokens |
+
+**Logits to distribution to choice.** `Sample` in `src/sampler.bm` does
+three things. `probs = softmax(logits / temperature)` turns scores into a
+distribution; dividing by a temperature below 1 stretches the gaps between
+logits so the softmax piles more mass on the top token, above 1 squashes
+them so the tail gets a real share. Then the distribution is trimmed: top-k
+keeps the k most likely tokens, top-p keeps the smallest set whose
+probabilities add up to p (the "nucleus"), which adapts to the shape of
+each step's distribution where a fixed k cannot. Finally one uniform random
+number walks the cumulative distribution of what is left.
+
+**Sampling is deterministic too.** The random numbers come from run.c's
+xorshift64* generator with a seed, so the oracle can re-implement the whole
+sampler in numpy on HuggingFace's logits, draw the same coins, and demand
+the same tokens. It gets them. The only way a seeded run can differ is a
+coin landing within fp32 drift of a boundary in the cdf, and the coins are
+printed per step so that can be checked when it happens.
+
+**Temperature as personality.** The same prompt, `Once upon a time`,
+eight tokens, top-p 0.9, three seeds per temperature; "candidates" is the
+average size of the nucleus per step:
+
+| temperature | candidates | distinct | continuations |
+|------------:|-----------:|---------:|---------------|
+| 0.2  | 1    | 1/3 | `, there was a little girl named Lily` (all three) |
+| 0.7  | 4    | 3/3 | `, in a land far away, there` / `, there was a little girl named Lily` / `, there was a wise old owl named` |
+| 1.0  | 137  | 3/3 | `, it was quite a distant hill country` / `, in a faraway land called Australia,` / ` in a small village,\nlived a` |
+| 1.5  | 5149 | 3/3 | `, Jeremy Staten was dismissed out on` / ` in Asia there was a bad badd` / `—and one organismesDate<|endoftext|>It` |
+
+At 0.2 the nucleus is one token and sampling is greedy with extra steps.
+At 0.7 a handful of plausible tokens compete and the stories differ while
+staying stories. At 1.0 the model is drawing from its real distribution,
+over a hundred tokens wide. At 1.5 the tail is in play, thousands of
+tokens, and the text falls apart. Nothing about the model changed between
+those rows, only how its scores are read.
+
+**Reserved word this step:** `LINE`. Also: `EOF(0)` blocks forever in
+console mode, so the REPL ends on `/quit` or three empty lines.
+
 ## Plan
 
 | step | what | checkpoint |
@@ -410,5 +469,5 @@ token, dropped silently, are the same kind of thing.
 | 5 | full forward + greedy decode | token-for-token match with `transformers` (done) |
 | 6 | KV cache | same output, measurably faster (done) |
 | 7 | BPE tokenizer | round-trip matches Python tokenizer (done) |
-| 8 | sampler + REPL | temp 0 reproduces greedy |
+| 8 | sampler + REPL | temp 0 reproduces greedy (done) |
 | 9 | int8 quantization (optional) | quality holds, faster |

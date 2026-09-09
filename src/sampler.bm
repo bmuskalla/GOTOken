@@ -1,0 +1,104 @@
+' sampler.bm - logits -> probability distribution -> one token.
+' Mirrors run.c's sampler: temperature, top-p (nucleus), and the xorshift64*
+' generator, plus top-k. A seed fixes every coin, so sampled output is as
+' reproducible as greedy.
+
+SUB InitSampler (temperature AS SINGLE, topP AS SINGLE, topK AS LONG, seed AS _UNSIGNED _INTEGER64)
+    samplerTemperature = temperature
+    samplerTopP = topP
+    samplerTopK = topK
+    rngState = seed
+    REDIM probs(0 TO cfg.vocabSize - 1) AS SINGLE
+    REDIM candIdx(0 TO cfg.vocabSize - 1) AS LONG
+    REDIM candProb(0 TO cfg.vocabSize - 1) AS SINGLE
+END SUB
+
+' xorshift64*, exactly run.c's random_u32 / random_f32
+FUNCTION RandomU32~& ()
+    rngState = rngState XOR _SHR(rngState, 12)
+    rngState = rngState XOR _SHL(rngState, 25)
+    rngState = rngState XOR _SHR(rngState, 27)
+    RandomU32~& = _SHR(rngState * 2685821657736338717, 32)
+END FUNCTION
+
+FUNCTION RandomF32! () ' uniform in [0, 1)
+    RandomF32! = _SHR(RandomU32~&, 8) / 16777216!
+END FUNCTION
+
+' sort candidates 0..n-1 by probability, descending (quicksort)
+SUB SortCandidates (lo AS LONG, hi AS LONG)
+    DIM i AS LONG, j AS LONG, pivot AS SINGLE, ti AS LONG, tp AS SINGLE
+    IF lo >= hi THEN EXIT SUB
+    pivot = candProb((lo + hi) \ 2)
+    i = lo: j = hi
+    WHILE i <= j
+        WHILE candProb(i) > pivot: i = i + 1: WEND
+        WHILE candProb(j) < pivot: j = j - 1: WEND
+        IF i <= j THEN
+            ti = candIdx(i): candIdx(i) = candIdx(j): candIdx(j) = ti
+            tp = candProb(i): candProb(i) = candProb(j): candProb(j) = tp
+            i = i + 1: j = j - 1
+        END IF
+    WEND
+    SortCandidates lo, j
+    SortCandidates i, hi
+END SUB
+
+' ---------------------------------------------------------------------------
+' Sample: pick the next token from logits(). Sets coin to the random number
+' used (for the oracle) and nCand to how many tokens were in the running.
+'
+' temperature 0        argmax, no randomness at all
+' temperature t        probs = softmax(logits / t). t < 1 sharpens (the
+'                      best token gets more of the mass), t > 1 flattens.
+' top-k                keep only the k most likely
+' top-p                keep only the smallest prefix (by prob) whose total
+'                      reaches p; drops the long tail of unlikely tokens
+'                      that a flat distribution would otherwise hit.
+' ---------------------------------------------------------------------------
+FUNCTION Sample& (coin AS SINGLE, nCand AS LONG)
+    DIM i AS LONG, n AS LONG, cutoff AS SINGLE, total AS SINGLE, lastIdx AS LONG, r AS SINGLE, cdf AS SINGLE
+    DIM best AS LONG, second AS LONG
+    IF samplerTemperature = 0 THEN
+        BestTwo best, second
+        coin = 0: nCand = 1
+        Sample& = best
+        EXIT FUNCTION
+    END IF
+
+    FOR i = 0 TO cfg.vocabSize - 1
+        probs(i) = logits(i) / samplerTemperature
+    NEXT
+    Softmax probs(), 0, cfg.vocabSize
+
+    ' Candidates. With top-p < 1, tokens below (1 - p) / (n - 1) can never be
+    ' part of the nucleus, so skip them before sorting (run.c's trick).
+    cutoff = 0
+    IF samplerTopP < 1 THEN cutoff = (1 - samplerTopP) / (cfg.vocabSize - 1)
+    n = 0
+    FOR i = 0 TO cfg.vocabSize - 1
+        IF probs(i) >= cutoff THEN
+            candIdx(n) = i: candProb(n) = probs(i): n = n + 1
+        END IF
+    NEXT
+    SortCandidates 0, n - 1
+    IF samplerTopK > 0 AND n > samplerTopK THEN n = samplerTopK
+
+    ' the nucleus: the shortest prefix whose probability reaches top-p
+    total = 0: lastIdx = n - 1
+    FOR i = 0 TO n - 1
+        total = total + candProb(i)
+        IF samplerTopP < 1 AND total > samplerTopP THEN lastIdx = i: EXIT FOR
+    NEXT
+    nCand = lastIdx + 1
+
+    ' one coin, scaled to the nucleus' total mass, walks the cdf
+    coin = RandomF32!
+    r = coin * total
+    cdf = 0
+    FOR i = 0 TO lastIdx
+        cdf = cdf + candProb(i)
+        IF r < cdf THEN Sample& = candIdx(i): EXIT FUNCTION
+    NEXT
+    Sample& = candIdx(lastIdx) ' rounding
+END FUNCTION

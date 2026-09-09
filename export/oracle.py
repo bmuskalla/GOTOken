@@ -15,6 +15,7 @@ Usage:
     python oracle.py step5 --tokens 504 2644 2643 --steps 8 --basic  # full forward + greedy decode
     python oracle.py step6 --tokens 504 2644 2643 --steps 8 --basic  # KV cache: same bits, timing curve
     python oracle.py step7 --basic                        # tokenizer round trip vs HF on the corpus
+    python oracle.py step8 --tokens 504 2644 2643 --basic  # sampler: temp 0 = greedy, seeded sampling vs reference
 """
 
 import argparse
@@ -317,7 +318,7 @@ def step5_greedy(model, tokens: list[int], steps: int) -> list[dict]:
 
 def parse_step5_gen(text: str) -> list[dict]:
     pat = (r"^gen\s+(\d+)\s+seqlen\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)\s+hex\s+([0-9a-f]{8})"
-           r"\s+margin\s*(\S+)\s+forwards\s+(\d+)\s+secs\s*(\S+)")
+           r"\s+margin\s*(\S+)(?:\s+coin\s*\S+\s+cand\s+\d+)?\s+forwards\s+(\d+)\s+secs\s*(\S+)")
     return [{"seqlen": int(m[2]), "id": int(m[3]), "logit": float(m[4]),
              "bits": np.frombuffer(bytes.fromhex(m[5]), dtype=F32)[0],
              "margin": float(m[6]), "forwards": int(m[7]), "secs": float(m[8].replace("D", "E"))}
@@ -455,6 +456,108 @@ def compare_step7(tok, n_random: int = 2000) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# step 8: the sampler. Same seed, same coins, same tokens.
+# --------------------------------------------------------------------------- #
+class XorShift64Star:
+    """run.c's random_u32 / random_f32, and the BASIC engine's."""
+    MASK = (1 << 64) - 1
+
+    def __init__(self, seed: int):
+        self.state = seed & self.MASK
+
+    def u32(self) -> int:
+        s = self.state
+        s ^= s >> 12
+        s ^= (s << 25) & self.MASK
+        s ^= s >> 27
+        self.state = s
+        return ((s * 0x2545F4914F6CDD1D) & self.MASK) >> 32
+
+    def f32(self) -> float:
+        return np.float32(self.u32() >> 8) / np.float32(16777216)
+
+
+def ref_sample(logits: np.ndarray, temperature: float, top_p: float, top_k: int, rng: XorShift64Star) -> tuple[int, float]:
+    """The BASIC Sample& function in numpy: temperature, top-p cutoff, sort,
+    top-k truncation, nucleus, one coin along the cdf. Returns (token, coin)."""
+    if temperature == 0:
+        return int(np.argmax(logits)), 0.0
+    x = (logits.astype(np.float32) / np.float32(temperature))
+    x = np.exp(x - x.max())
+    probs = x / x.sum()
+    n = len(probs)
+    cutoff = np.float32((1 - top_p) / (n - 1)) if top_p < 1 else 0
+    cand = np.nonzero(probs >= cutoff)[0]
+    cand = cand[np.argsort(-probs[cand], kind="stable")]
+    if top_k > 0:
+        cand = cand[:top_k]
+    total, last = np.float32(0), len(cand) - 1
+    for i, t in enumerate(cand):
+        total += probs[t]
+        if top_p < 1 and total > top_p:
+            last = i
+            break
+    coin = rng.f32()
+    r, cdf = coin * total, np.float32(0)
+    for t in cand[: last + 1]:
+        cdf += probs[t]
+        if r < cdf:
+            return int(t), float(coin)
+    return int(cand[last]), float(coin)
+
+
+def ref_sampled_decode(model, tokens: list[int], steps: int, temperature: float, top_p: float, top_k: int, seed: int) -> list[dict]:
+    rng, seq, out = XorShift64Star(seed), list(tokens), []
+    for _ in range(steps):
+        t, coin = ref_sample(step5_logits(model, seq), temperature, top_p, top_k, rng)
+        out.append({"id": t, "coin": coin})
+        seq.append(t)
+    return out
+
+
+def parse_step8_gen(text: str) -> list[dict]:
+    pat = r"^gen\s+(\d+)\s+seqlen\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)\s+hex\s+([0-9a-f]{8})\s+margin\s*(\S+)\s+coin\s*(\S+)\s+cand\s+(\d+)"
+    return [{"id": int(m[3]), "logit": float(m[4]), "margin": float(m[6]), "coin": float(m[7]), "cand": int(m[8])}
+            for m in re.finditer(pat, text, re.M)]
+
+
+def compare_step8(model, tok, tokens: list[int], steps: int = 8) -> bool:
+    ok = True
+    # 1. temperature 0 is greedy, exactly
+    greedy = [g["id"] for g in step5_greedy(model, tokens, steps)]
+    got = [g["id"] for g in parse_step8_gen(run_basic("sample", steps, 0, 1, 0, 42, *tokens))]
+    same = got == greedy
+    ok &= same
+    print(f"\ntemperature 0 vs HF greedy: {'identical' if same else 'MISMATCH'}  {tok.decode(got)!r}")
+
+    # 2. a seeded sampled run, token for token against the reference sampler on HF logits
+    for temperature, top_p, top_k, seed in [(0.8, 0.9, 0, 42), (1.0, 1.0, 40, 7)]:
+        basic = parse_step8_gen(run_basic("sample", steps, temperature, top_p, top_k, seed, *tokens))
+        ref = ref_sampled_decode(model, tokens, steps, temperature, top_p, top_k, seed)
+        n_match = next((i for i, (a, b) in enumerate(zip(basic, ref)) if a["id"] != b["id"]), steps)
+        ok &= n_match == steps
+        print(f"temperature {temperature} top-p {top_p} top-k {top_k} seed {seed}: BASIC vs reference sampler "
+              f"{n_match}/{steps} tokens  {tok.decode([b['id'] for b in basic])!r}")
+        for s_, (a, b) in enumerate(zip(basic, ref)):
+            flag = "ok" if a["id"] == b["id"] else "MISMATCH"
+            print(f"    step {s_}: coin {a['coin']:.7f} vs {b['coin']:.7f}  candidates {a['cand']:5d}  "
+                  f"basic {a['id']:6d} {tok.convert_ids_to_tokens(a['id'])!r:<14} ref {b['id']:6d}  {flag}")
+
+    # 3. how the temperature changes the output: three seeds each
+    print(f"\nprompt {tok.decode(tokens)!r}, {steps} tokens, top-p 0.9, three seeds per temperature")
+    for temperature in (0.2, 0.7, 1.0, 1.5):
+        outs = []
+        for seed in (1, 2, 3):
+            g = parse_step8_gen(run_basic("sample", steps, temperature, 0.9, 0, seed, *tokens))
+            outs.append((tok.decode([x["id"] for x in g]), int(np.mean([x["cand"] for x in g]))))
+        print(f"  temperature {temperature}: avg candidates {int(np.mean([c for _, c in outs])):5d}  distinct {len({o for o, _ in outs})}/3")
+        for o, _ in outs:
+            print(f"      {o!r}")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -481,6 +584,10 @@ def main() -> int:
     p = sub.add_parser("step7", help="tokenizer: BASIC encode/decode vs HuggingFace on the corpus")
     p.add_argument("--random", type=int, default=2000)
     p.add_argument("--basic", action="store_true", help="run build/gotoken encode-batch and compare")
+    p = sub.add_parser("step8", help="sampler: temperature 0 = greedy, seeded sampling vs a reference")
+    p.add_argument("--tokens", type=int, nargs="+", required=True)
+    p.add_argument("--steps", type=int, default=8)
+    p.add_argument("--basic", action="store_true", help="run build/gotoken sample and compare")
     args = ap.parse_args()
 
     tok = load_tokenizer()
@@ -523,6 +630,10 @@ def main() -> int:
         if not args.basic:
             sys.exit("step6 is a BASIC measurement; pass --basic")
         return 0 if compare_step6(model, tok, args.tokens, args.steps, args.long) else 1
+    if args.cmd == "step8":
+        if not args.basic:
+            sys.exit("step8 compares the BASIC sampler; pass --basic")
+        return 0 if compare_step8(model, tok, args.tokens, args.steps) else 1
     return 0
 
 

@@ -12,6 +12,8 @@
 '         gotoken decode <id> [<id> ...]       step 7: token ids -> text
 '         gotoken encode-batch <file>          step 7: many strings (INT32 count; INT32 len + bytes each)
 '         gotoken complete <steps> "<text>"    step 7: greedy completion of a text prompt
+'         gotoken sample <steps> <temp> <topp> <topk> <seed> <id> [...]  step 8: sampled decode
+'         gotoken repl [temp] [topp] [topk] [seed]   step 8: interactive; /temp /topp /topk /seed /steps /quit
 ' Set GOTOKEN_WEIGHTS / GOTOKEN_TOKENIZER to use files other than ./model/*.bin.
 '
 ' Layout: QB64 has no modules, only textual includes. Declarations (.bi) go
@@ -26,9 +28,10 @@ OPTION _EXPLICIT
 '$INCLUDE: 'src/model.bi'
 '$INCLUDE: 'src/state.bi'
 '$INCLUDE: 'src/tokenizer.bi'
+'$INCLUDE: 'src/sampler.bi'
 
 DIM path AS STRING, tokPath AS STRING, cmd AS STRING, token AS LONG, t0 AS DOUBLE, n AS LONG, i AS LONG
-DIM text AS STRING, f AS LONG, count AS LONG, k AS LONG
+DIM text AS STRING, f AS LONG, count AS LONG, k AS LONG, steps AS LONG, userLine AS STRING, arg AS STRING
 REDIM tokens(0 TO 0) AS LONG
 
 ' Like run.c: the checkpoint path comes from outside. QB64 chdirs into the
@@ -41,7 +44,7 @@ IF tokPath = "" THEN tokPath = _STARTDIR$ + "/model/tokenizer.bin"
 cmd = COMMAND$(1)
 
 ' the tokenizer-only commands do not need 538 MB of weights
-IF cmd = "encode" OR cmd = "decode" OR cmd = "encode-batch" OR cmd = "complete" THEN
+IF cmd = "encode" OR cmd = "decode" OR cmd = "encode-batch" OR cmd = "complete" OR cmd = "repl" THEN
     t0 = TIMER(0.001)
     LoadTokenizer tokPath
     PRINT "loaded"; tokVocabSize; "tokens in"; TIMER(0.001) - t0; "s"
@@ -50,6 +53,7 @@ IF cmd <> "encode" AND cmd <> "decode" AND cmd <> "encode-batch" THEN
     t0 = TIMER(0.001)
     LoadModel path
     AllocRunState
+    InitSampler 0, 1, 0, 42 ' greedy unless a command says otherwise
     PRINT "loaded"; nParams; "floats in"; TIMER(0.001) - t0; "s"
 END IF
 
@@ -140,6 +144,51 @@ SELECT CASE cmd
         PRINT
         Generate tokens(), n, VAL(COMMAND$(2)), 1
         PRINT "text: "; Decode$(genSeq(), genLen)
+    CASE "sample"
+        n = _COMMANDCOUNT - 6
+        IF n < 1 THEN Fail "sample needs <steps> <temp> <topp> <topk> <seed> and token ids"
+        InitSampler VAL(COMMAND$(3)), VAL(COMMAND$(4)), VAL(COMMAND$(5)), VAL(COMMAND$(6))
+        REDIM tokens(0 TO n - 1) AS LONG
+        FOR i = 0 TO n - 1
+            tokens(i) = VAL(COMMAND$(i + 7))
+        NEXT
+        Generate tokens(), n, VAL(COMMAND$(2)), 1
+    CASE "repl"
+        ' each userLine is a fresh prompt; /temp /topp /topk /seed /steps change settings
+        InitSampler 0.7, 0.9, 0, 42
+        IF COMMAND$(2) <> "" THEN samplerTemperature = VAL(COMMAND$(2))
+        IF COMMAND$(3) <> "" THEN samplerTopP = VAL(COMMAND$(3))
+        IF COMMAND$(4) <> "" THEN samplerTopK = VAL(COMMAND$(4))
+        IF COMMAND$(5) <> "" THEN rngState = VAL(COMMAND$(5))
+        steps = 64
+        genStream = 1
+        PRINT "temperature"; samplerTemperature; " top-p"; samplerTopP; " top-k"; samplerTopK; " steps"; steps
+        k = 0 ' consecutive empty lines; three in a row ends the session (piped input has no EOF here)
+        DO
+            PRINT "> ";
+            LINE INPUT userLine
+            IF userLine = "/quit" THEN EXIT DO
+            IF userLine = "" THEN k = k + 1 ELSE k = 0
+            IF k >= 3 THEN EXIT DO
+            IF LEFT$(userLine, 1) = "/" THEN
+                arg = MID$(userLine, INSTR(userLine + " ", " ") + 1)
+                SELECT CASE LEFT$(userLine, INSTR(userLine + " ", " ") - 1)
+                    CASE "/temp": samplerTemperature = VAL(arg)
+                    CASE "/topp": samplerTopP = VAL(arg)
+                    CASE "/topk": samplerTopK = VAL(arg)
+                    CASE "/seed": rngState = VAL(arg)
+                    CASE "/steps": steps = VAL(arg)
+                    CASE ELSE: PRINT "commands: /temp t  /topp p  /topk k  /seed s  /steps n  /quit"
+                END SELECT
+                PRINT "temperature"; samplerTemperature; " top-p"; samplerTopP; " top-k"; samplerTopK; " steps"; steps
+            ELSEIF userLine <> "" THEN
+                Encode userLine, tokens(), n
+                IF n > 0 THEN
+                    PRINT userLine;
+                    Generate tokens(), n, steps, 1
+                END IF
+            END IF
+        LOOP
     CASE ELSE
         Fail "unknown command: " + cmd
 END SELECT
@@ -150,5 +199,6 @@ SYSTEM
 '$INCLUDE: 'src/kernels.bm'
 '$INCLUDE: 'src/forward.bm'
 '$INCLUDE: 'src/tokenizer.bm'
+'$INCLUDE: 'src/sampler.bm'
 '$INCLUDE: 'src/generate.bm'
 '$INCLUDE: 'src/checks.bm'

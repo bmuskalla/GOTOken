@@ -33,8 +33,9 @@ END SUB
 ' once, at its own position. Same rows, same bits, one forward per token.
 ' ---------------------------------------------------------------------------
 SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG, useCache AS LONG)
-    DIM n AS LONG, s AS LONG, p AS LONG, best AS LONG, second AS LONG
+    DIM n AS LONG, s AS LONG, p AS LONG, best AS LONG, second AS LONG, nxt AS LONG
     DIM t0 AS DOUBLE, tStart AS DOUBLE, forwards AS LONG, stepForwards AS LONG
+    DIM coin AS SINGLE, nCand AS LONG
     REDIM seq(0 TO nPrompt + nSteps - 1) AS LONG
     FOR p = 0 TO nPrompt - 1
         seq(p) = prompt(p)
@@ -57,13 +58,24 @@ SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG, useCache AS LON
         END IF
         forwards = forwards + stepForwards
         BestTwo best, second
-        ' PRINT puts a space before positive numbers but not negative ones, so
-        ' every label ends in an explicit space or the parser sees "logit-0.48".
-        PRINT "gen"; s; " seqlen"; n; " id"; best; " logit "; logits(best); " hex "; FloatHex$(logits(best)); " margin "; logits(best) - logits(second); " forwards"; stepForwards; " secs "; TIMER(0.001) - t0
-        seq(n) = best
+        nxt = Sample&(coin, nCand) ' = best when temperature is 0
+        IF genStream THEN
+            IF nxt = 0 THEN EXIT FOR ' <|endoftext|>
+            PRINT tokStr(nxt);
+        ELSE
+            ' PRINT puts a space before positive numbers but not negative ones, so
+            ' every label ends in an explicit space or the parser sees "logit-0.48".
+            PRINT "gen"; s; " seqlen"; n; " id"; nxt; " logit "; logits(nxt); " hex "; FloatHex$(logits(nxt)); " margin "; logits(best) - logits(second); " coin "; coin; " cand"; nCand; " forwards"; stepForwards; " secs "; TIMER(0.001) - t0
+        END IF
+        seq(n) = nxt
         n = n + 1
     NEXT
-    PRINT "generated"; nSteps; "tokens with"; forwards; "forwards in"; TIMER(0.001) - tStart; "s"
+    IF genStream THEN
+        PRINT
+        PRINT "["; n - nPrompt; "tokens,"; forwards; "forwards,"; TIMER(0.001) - tStart; "s ]"
+    ELSE
+        PRINT "generated"; nSteps; "tokens with"; forwards; "forwards in"; TIMER(0.001) - tStart; "s"
+    END IF
     REDIM genSeq(0 TO n - 1) AS LONG
     FOR p = 0 TO n - 1
         genSeq(p) = seq(p)

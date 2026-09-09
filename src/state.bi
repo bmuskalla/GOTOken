@@ -23,3 +23,7 @@ REDIM SHARED valueCache(0 TO 0) AS SINGLE
 ' The token sequence of the last Generate call (prompt + generated).
 REDIM SHARED genSeq(0 TO 0) AS LONG
 DIM SHARED genLen AS LONG
+
+' Generate output mode: 0 = one "gen ..." line per token (for the oracle),
+' 1 = stream the decoded text and stop at <|endoftext|> (the REPL).
+DIM SHARED genStream AS LONG
