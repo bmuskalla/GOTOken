@@ -176,4 +176,7 @@ continues text). Special tokens typed into a prompt are treated as plain
 text. The obvious next step, int8 weights with per-row scales, is step 9
 of the plan and has not been done.
 
-The model is Apache 2.0, from HuggingFace's SmolLM2 family.
+## License
+
+Apache 2.0, see [LICENSE](LICENSE). The model, SmolLM2-135M from HuggingFace,
+is Apache 2.0 as well.
