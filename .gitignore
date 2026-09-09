@@ -1,0 +1,9 @@
+# exported binaries (regenerate with export/export.py)
+*.bin
+# python
+export/.venv/
+__pycache__/
+*.pyc
+# QB64 build output
+*.exe
+*.o
