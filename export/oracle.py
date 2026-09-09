@@ -13,6 +13,7 @@ Usage:
     python oracle.py step3 --token 9690 --basic   # RMSNorm + MatMul in isolation vs BASIC
     python oracle.py step4 --tokens 504 2644 2643 --basic  # layer 0 over a sequence vs a forward hook
     python oracle.py step5 --tokens 504 2644 2643 --steps 8 --basic  # full forward + greedy decode
+    python oracle.py step6 --tokens 504 2644 2643 --steps 8 --basic  # KV cache: same bits, timing curve
 """
 
 import argparse
@@ -314,8 +315,12 @@ def step5_greedy(model, tokens: list[int], steps: int) -> list[dict]:
 
 
 def parse_step5_gen(text: str) -> list[dict]:
-    return [{"id": int(m[2]), "logit": float(m[3]), "margin": float(m[4]), "secs": float(m[5].replace("D", "E"))}
-            for m in re.finditer(r"^gen\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)\s+margin\s*(\S+)\s+forwards\s+\d+\s+secs\s*(\S+)", text, re.M)]
+    pat = (r"^gen\s+(\d+)\s+seqlen\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)\s+hex\s+([0-9a-f]{8})"
+           r"\s+margin\s*(\S+)\s+forwards\s+(\d+)\s+secs\s*(\S+)")
+    return [{"seqlen": int(m[2]), "id": int(m[3]), "logit": float(m[4]),
+             "bits": np.frombuffer(bytes.fromhex(m[5]), dtype=F32)[0],
+             "margin": float(m[6]), "forwards": int(m[7]), "secs": float(m[8].replace("D", "E"))}
+            for m in re.finditer(pat, text, re.M)]
 
 
 def compare_step5(model, tok, tokens: list[int], steps: int, rtol: float = 1e-3, atol: float = 1e-3) -> bool:
@@ -339,9 +344,9 @@ def compare_step5(model, tok, tokens: list[int], steps: int, rtol: float = 1e-3,
 
     # 2. greedy decoding, token for token
     ref_gen = step5_greedy(model, tokens, steps)
-    text = run_basic("generate", steps, *tokens)
+    text = run_basic("generate-nocache", steps, *tokens)
     got_gen = parse_step5_gen(text)
-    print(f"\ngreedy decode, {steps} tokens")
+    print(f"\ngreedy decode without KV cache, {steps} tokens")
     for s, (g, r) in enumerate(zip(got_gen, ref_gen)):
         flag = "ok" if g["id"] == r["id"] else "MISMATCH"
         ok &= flag == "ok"
@@ -354,6 +359,47 @@ def compare_step5(model, tok, tokens: list[int], steps: int, rtol: float = 1e-3,
     m = re.search(r"generated\s+\d+\s+tokens with\s+(\d+)\s+forwards in\s+(\S+)", text)
     if m:
         print(f"  BASIC: {m[1]} forwards in {float(m[2]):.1f}s, {steps / float(m[2]):.2f} tok/s")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# step 6: the KV cache. Same bits as step 5, one forward per token.
+# --------------------------------------------------------------------------- #
+def compare_step6(model, tok, tokens: list[int], steps: int, long_steps: int = 24) -> bool:
+    ok = True
+    ref_gen = step5_greedy(model, tokens, steps)
+    nocache = parse_step5_gen(run_basic("generate-nocache", steps, *tokens))
+    cache = parse_step5_gen(run_basic("generate", steps, *tokens))
+    assert len(nocache) == len(cache) == steps, (len(nocache), len(cache))
+
+    print(f"\nKV cache vs re-forwarding the prefix, prompt {[tok.convert_ids_to_tokens(t) for t in tokens]}, {steps} tokens")
+    print("  step  seqlen  token            HF  same id  same bits   no-cache fwds  secs   cache fwds  secs   speedup")
+    for s_, (a, b, r) in enumerate(zip(nocache, cache, ref_gen)):
+        same_id = a["id"] == b["id"] == r["id"]
+        same_bits = a["bits"] == b["bits"]
+        ok &= same_id and same_bits
+        print(f"  {s_:4d}  {b['seqlen']:6d}  {tok.convert_ids_to_tokens(b['id'])!r:<14} {r['id']:6d}  "
+              f"{'yes' if same_id else 'NO ':>7}  {'yes' if same_bits else 'NO ':>9}   "
+              f"{a['forwards']:13d}  {a['secs']:5.1f}   {b['forwards']:10d}  {b['secs']:5.2f}   {a['secs'] / b['secs']:5.1f}x")
+    t_no, t_c = sum(a["secs"] for a in nocache), sum(b["secs"] for b in cache)
+    f_no, f_c = sum(a["forwards"] for a in nocache), sum(b["forwards"] for b in cache)
+    print(f"  total: no-cache {f_no} forwards {t_no:.1f}s ({steps / t_no:.2f} tok/s), "
+          f"cache {f_c} forwards {t_c:.1f}s ({steps / t_c:.2f} tok/s), {t_no / t_c:.1f}x")
+
+    # A longer cached run: per-token time should stay flat. Attention grows with
+    # the sequence length, but it is a sliver next to the fixed matmul cost.
+    long = parse_step5_gen(run_basic("generate", long_steps, *tokens))
+    secs = [g["secs"] for g in long[1:]]
+    print(f"\ncached run of {long_steps} tokens: per-token secs after prefill "
+          f"first {secs[0]:.2f}, middle {secs[len(secs) // 2]:.2f}, last {secs[-1]:.2f} at seqlen {long[-1]['seqlen']}")
+    ids = tokens + [g["id"] for g in long]
+    print(f"  text: {tok.decode(tokens)!r} -> {tok.decode(ids[len(tokens):])!r}")
+    hf = model.generate(torch.tensor([tokens]), max_new_tokens=long_steps, do_sample=False,
+                        pad_token_id=model.config.eos_token_id)[0, len(tokens):].tolist()
+    n_match = next((i for i, (a, b) in enumerate(zip(ids[len(tokens):], hf)) if a != b), long_steps)
+    print(f"  matches HF greedy for {n_match}/{long_steps} tokens")
+    ok &= n_match == long_steps
     print("PASS" if ok else "FAIL")
     return ok
 
@@ -377,6 +423,11 @@ def main() -> int:
     p.add_argument("--tokens", type=int, nargs="+", required=True)
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--basic", action="store_true", help="run build/gotoken forward/generate and compare")
+    p = sub.add_parser("step6", help="KV cache: same output as step 5, timing curve")
+    p.add_argument("--tokens", type=int, nargs="+", required=True)
+    p.add_argument("--steps", type=int, default=8)
+    p.add_argument("--long", type=int, default=24, help="length of the cached-only run")
+    p.add_argument("--basic", action="store_true", help="run both generate modes and compare")
     args = ap.parse_args()
 
     tok = load_tokenizer()
@@ -411,6 +462,10 @@ def main() -> int:
             print(f"gen {s_} id {g['id']} logit {g['logit']:.6f} margin {g['margin']:.3f}   {tok.convert_ids_to_tokens(g['id'])!r}")
         if args.basic:
             return 0 if compare_step5(model, tok, args.tokens, args.steps) else 1
+    if args.cmd == "step6":
+        if not args.basic:
+            sys.exit("step6 is a BASIC measurement; pass --basic")
+        return 0 if compare_step6(model, tok, args.tokens, args.steps, args.long) else 1
     return 0
 
 

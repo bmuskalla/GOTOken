@@ -6,7 +6,8 @@
 '         gotoken kernels <token_id> step 3: RMSNorm and MatMul on layer 0, in isolation
 '         gotoken layer <id> [<id> ...]  step 4: layer 0 over a token sequence, output at the last
 '         gotoken forward <id> [<id> ...]      step 5: full forward, logits at the last position
-'         gotoken generate <steps> <id> [...]  step 5: greedy decode from the prompt ids
+'         gotoken generate <steps> <id> [...]  step 6: greedy decode with the KV cache
+'         gotoken generate-nocache <steps> <id> [...]  step 5: same, re-forwarding the prefix
 ' Set GOTOKEN_WEIGHTS to use a weights.bin other than ./model/weights.bin.
 '
 ' Layout: QB64 has no modules, only textual includes. Declarations (.bi) go
@@ -76,14 +77,14 @@ SELECT CASE cmd
         NEXT
         PRINT "forwarded"; n; "positions in"; TIMER(0.001) - t0; "s"
         PrintLogits 5
-    CASE "generate"
+    CASE "generate", "generate-nocache"
         n = _COMMANDCOUNT - 2
         IF n < 1 THEN Fail "generate needs <steps> and at least one token id"
         REDIM tokens(0 TO n - 1) AS LONG
         FOR i = 0 TO n - 1
             tokens(i) = VAL(COMMAND$(i + 3))
         NEXT
-        Generate tokens(), n, VAL(COMMAND$(2))
+        Generate tokens(), n, VAL(COMMAND$(2)), -(cmd = "generate")
     CASE ELSE
         Fail "unknown command: " + cmd
 END SELECT

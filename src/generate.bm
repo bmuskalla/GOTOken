@@ -22,13 +22,19 @@ END SUB
 ' repeat. That loop is autoregression: the model only ever predicts one next
 ' token, and text comes from feeding its own output back in.
 '
-' Step 5 keeps nothing between tokens: for every new token the whole sequence
-' is forwarded again from position 0, so token s costs nPrompt + s forwards.
-' Step 6 keeps the caches and forwards only the new position.
+' useCache = 0 is step 5: every new token re-forwards the whole sequence
+' from position 0, so step s costs nPrompt + s forwards.
+'
+' useCache = 1 is step 6, the KV cache. Forward at position p only ever
+' reads the residual stream of position p plus the k and v rows of
+' positions 0..p, and a row, once written, never changes: position t's k
+' and v depend only on tokens 0..t, which are fixed. So the prompt is
+' forwarded once (prefill), and after that each new token is forwarded
+' once, at its own position. Same rows, same bits, one forward per token.
 ' ---------------------------------------------------------------------------
-SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG)
+SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG, useCache AS LONG)
     DIM n AS LONG, s AS LONG, p AS LONG, best AS LONG, second AS LONG
-    DIM t0 AS DOUBLE, tStart AS DOUBLE, forwards AS LONG
+    DIM t0 AS DOUBLE, tStart AS DOUBLE, forwards AS LONG, stepForwards AS LONG
     REDIM seq(0 TO nPrompt + nSteps - 1) AS LONG
     FOR p = 0 TO nPrompt - 1
         seq(p) = prompt(p)
@@ -38,14 +44,22 @@ SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG)
     forwards = 0
     FOR s = 0 TO nSteps - 1
         t0 = TIMER(0.001)
-        FOR p = 0 TO n - 1 ' the whole sequence, every time (no KV cache yet)
-            Forward seq(p), p
-        NEXT
-        forwards = forwards + n
+        IF useCache = 0 OR s = 0 THEN
+            ' the whole sequence: always without a cache, once (prefill) with one
+            FOR p = 0 TO n - 1
+                Forward seq(p), p
+            NEXT
+            stepForwards = n
+        ELSE
+            ' only the token appended last step; rows 0..n-2 are still in the cache
+            Forward seq(n - 1), n - 1
+            stepForwards = 1
+        END IF
+        forwards = forwards + stepForwards
         BestTwo best, second
         ' PRINT puts a space before positive numbers but not negative ones, so
         ' every label ends in an explicit space or the parser sees "logit-0.48".
-        PRINT "gen"; s; " id"; best; " logit "; logits(best); " margin "; logits(best) - logits(second); " forwards"; n; " secs "; TIMER(0.001) - t0
+        PRINT "gen"; s; " seqlen"; n; " id"; best; " logit "; logits(best); " hex "; FloatHex$(logits(best)); " margin "; logits(best) - logits(second); " forwards"; stepForwards; " secs "; TIMER(0.001) - t0
         seq(n) = best
         n = n + 1
     NEXT

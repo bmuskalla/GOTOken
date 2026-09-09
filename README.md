@@ -30,7 +30,7 @@ relative to the including file.
     src/state.bi    activations of the current forward pass (run.c RunState)
     src/kernels.bm  MatMul, RmsNorm, Softmax
     src/forward.bm  Embed, Rope, TransformerLayer, Forward, Classify
-    src/generate.bm Generate (greedy decoding), BestTwo
+    src/generate.bm Generate (greedy decoding, with or without the KV cache), BestTwo
     src/checks.bm   checkpoint printers in a format oracle.py parses
     src/util.bm     FloatHex$, Fail
 
@@ -289,6 +289,54 @@ the quadratic term; the linear per-forward cost is step 9's problem.
 space. Worth knowing: the greedy pick can have a negative logit, logits are
 scores, not probabilities.
 
+## Step 6: the KV cache
+
+```bash
+./build.sh
+./build/gotoken generate 8 504 2644 2643 335 260            # with the cache
+./build/gotoken generate-nocache 8 504 2644 2643 335 260    # step 5 behaviour
+cd export && .venv/bin/python oracle.py step6 --tokens 504 2644 2643 335 260 --steps 8 --long 24 --basic
+```
+
+The cache arrays have existed since step 4: `keyCache` and `valueCache`,
+`[n_layers][max_seq][kv_dim]`, because attention at position *p* needs the
+k and v of positions 0..*p* no matter what. What changes in step 6 is only
+the loop in `Generate`: the prompt is forwarded once (prefill), and after
+that each new token is forwarded once, at its own position. Nothing is
+recomputed because nothing can change: position *t*'s k and v depend only
+on tokens 0..*t*, which are fixed.
+
+| step | seqlen | no cache: forwards, secs | cache: forwards, secs | speedup |
+|-----:|-------:|-------------------------:|----------------------:|--------:|
+| 0    | 5      | 5, 4.8                   | 5, 4.8                | 1.0x    |
+| 1    | 6      | 6, 5.7                   | 1, 0.96               | 6.0x    |
+| 3    | 8      | 8, 7.7                   | 1, 0.96               | 8.0x    |
+| 5    | 10     | 10, 9.6                  | 1, 0.96               | 10.0x   |
+| 7    | 12     | 12, 11.5                 | 1, 0.96               | 12.0x   |
+| total| 8 tokens | 68 forwards, 65.3 s, 0.12 tok/s | 12 forwards, 11.5 s, 0.69 tok/s | 5.7x |
+
+Every chosen logit is bit-identical between the two runs (the oracle
+compares the raw fp32 bits), and the cached run matches HuggingFace greedy
+for 24/24 tokens. Per-token time after prefill is flat: 0.97 s at the first
+token and 0.97 s at sequence length 28.
+
+**This is the optimization.** Without the cache, generating *n* tokens
+costs about n²/2 forwards; with it, *n*. The speedup at step *s* is exactly
+`n_prompt + s`, so the curve in the table is the lesson: the longer the
+sequence, the bigger the win, without bound. Everything else in inference
+engineering is about making one forward cheaper; this is the one change
+that makes fewer of them happen.
+
+**What it costs.** Memory. Each position stores k and v for every layer:
+`30 layers x 192 x 2 x 4 bytes = 46 KB` per position, so 47 MB at the
+engine's `maxSeq` of 1024 and 377 MB at the model's full 8192 context.
+GQA is why it is not three times that: with 9 query heads and 3 KV heads,
+only the 3 KV heads' worth is stored. As the sequence grows the cache, not
+the weights, is what fills memory.
+
+**What it does not fix.** The one forward per token still takes 0.96 s,
+all of it in matmul against 538 MB of weights. That is step 9's problem.
+
 ## Plan
 
 | step | what | checkpoint |
@@ -299,7 +347,7 @@ scores, not probabilities.
 | 3 | matmul + RMSNorm kernels | match Python within ~1e-5 (done) |
 | 4 | one transformer layer | layer-0 output matches a forward hook (done) |
 | 5 | full forward + greedy decode | token-for-token match with `transformers` (done) |
-| 6 | KV cache | same output, measurably faster |
+| 6 | KV cache | same output, measurably faster (done) |
 | 7 | BPE tokenizer | round-trip matches Python tokenizer |
 | 8 | sampler + REPL | temp 0 reproduces greedy |
 | 9 | int8 quantization (optional) | quality holds, faster |
