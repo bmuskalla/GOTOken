@@ -13,7 +13,8 @@ before the next one starts.
     export/        Python: turns the HF checkpoint into flat binaries
     model/         weights.bin + tokenizer.bin (generated, not committed)
     FORMAT.md      exact byte layout of both binaries
-    *.bas          the engine (coming step by step)
+    gotoken.bas    the engine, one file, growing step by step
+    build.sh       compiles gotoken.bas with QB64 into build/gotoken
 
 ## Step 0: export the model
 
@@ -39,6 +40,39 @@ step 1 loader; they are also recorded in `FORMAT.md`.
 The script also verifies two things on every run: that the Q/K row permutation
 it applies for RoPE leaves attention scores unchanged, and that token bytes it
 exports rebuild the original text from HuggingFace token ids.
+
+## Step 1: load the weights in BASIC
+
+Uses classic [QB64 2.1](https://qb64.com). On macOS the release tarball
+ships as source and builds itself with clang (needs Xcode command line tools):
+
+```bash
+curl -sSL -o /tmp/qb64.tar.gz https://github.com/QB64Official/qb64/releases/download/v2.1/qb64_dev_2022-09-08-07-14-00_47f5044_osx.tar.gz
+tar xzf /tmp/qb64.tar.gz -C /tmp && mv /tmp/qb64_*_osx ~/qb64
+cd ~/qb64 && find . -name "*.command" -exec chmod +x {} \;
+(cd internal/c/libqb/os/osx && ./setup_build.command)
+(cd internal/c/parts/video/font/ttf/os/osx && ./setup_build.command)
+cp internal/source/* internal/temp/
+(cd internal/c && clang++ -w qbx.cpp libqb/os/osx/libqb_setup.o parts/video/font/ttf/os/osx/src.o -framework GLUT -framework OpenGL -framework Cocoa -o ../../qb64)
+```
+
+(That is `setup_osx.command` minus the step that launches the IDE.) Then:
+
+```bash
+./build.sh && ./build/gotoken
+```
+
+The program reads the 48-byte header into a `TYPE`, computes where every
+tensor starts, loads all 134.5M floats into one `SINGLE` array with a single
+`GET`, and prints the first and last five floats with their raw bytes. Both
+must match the `FORMAT.md` tables exactly. An optional argument overrides the
+checkpoint path, like `run.c`.
+
+Why one array: `run.c` mmaps the file and keeps `float*` pointers into it.
+BASIC has no pointers, so the engine keeps one array `w()` and a `LONG`
+offset per tensor. Element `(o, i)` of a `[out, in]` matrix at offset `p` is
+`w(p + o * in + i)`, which is the layout the matmul in step 3 reads
+contiguously.
 
 ## Plan
 

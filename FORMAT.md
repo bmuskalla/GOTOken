@@ -136,5 +136,17 @@ First 5 floats of `token_embedding` (row 0), as stored:
 | 3     | -0.0079345703125 | `00 00 02 bc` |
 | 4     | -0.05615234375   | `00 00 66 bd` |
 
-The low two bytes are always zero: the checkpoint is bf16, and bf16 to fp32
-just pads the mantissa with 16 zero bits, so the conversion is exact.
+Last 5 floats of the file (tail of `rms_final`):
+
+| index | value      | bytes on disk |
+|------:|------------|---------------|
+| 0     | 2.28125    | `00 00 12 40` |
+| 1     | 1.90625    | `00 00 f4 3f` |
+| 2     | 1.8671875  | `00 00 ef 3f` |
+| 3     | 1.90625    | `00 00 f4 3f` |
+| 4     | 1.984375   | `00 00 fe 3f` |
+
+The head proves the header offset is right; the tail proves every blob size
+in between was added up correctly. The low two bytes are always zero: the
+checkpoint is bf16, and bf16 to fp32 just pads the mantissa with 16 zero
+bits, so the conversion is exact.

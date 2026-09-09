@@ -310,6 +310,12 @@ def print_checkpoint(weights_path: Path, tokenizer_path: Path) -> None:
 
     n_params = (weights_path.stat().st_size - HEADER_SIZE) // 4
     print(f"\n  total fp32 params in file: {n_params:,}")
+    with open(weights_path, "rb") as f:
+        f.seek(-5 * 4, 2)
+        last5 = np.frombuffer(f.read(5 * 4), dtype=F32)
+    print("\nlast 5 floats of the file (tail of rms_final; proves the blob-size arithmetic):")
+    for i, v in enumerate(last5):
+        print(f"  [{i}] {float(v)!r:<16} hex {v.tobytes().hex()}")
 
     with open(tokenizer_path, "rb") as f:
         vocab_size, max_len = struct.unpack("<ii", f.read(8))

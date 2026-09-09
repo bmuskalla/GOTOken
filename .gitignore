@@ -7,3 +7,4 @@ __pycache__/
 # QB64 build output
 *.exe
 *.o
+build/
