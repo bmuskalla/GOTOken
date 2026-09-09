@@ -28,8 +28,8 @@ relative to the including file.
     src/model.bi    Config TYPE, the flat weight array w(), per-tensor offsets
     src/model.bm    LoadModel, MapWeights
     src/state.bi    activations of the current forward pass (run.c RunState)
-    src/kernels.bm  MatMul, RmsNorm (softmax, RoPE, ... arrive with their steps)
-    src/forward.bm  Embed, Classify (grows into run.c's forward)
+    src/kernels.bm  MatMul, RmsNorm, Softmax
+    src/forward.bm  Embed, Rope, TransformerLayer, Classify (grows into run.c's forward)
     src/checks.bm   checkpoint printers in a format oracle.py parses
     src/util.bm     FloatHex$, Fail
 
@@ -163,6 +163,73 @@ outputs. `atol + rtol * |ref|` covers both. 1e-5 is comfortable here: the
 expected error of a 576-term fp32 sum is around sqrt(576) x 6e-8 x (typical
 partial sum), and the observed errors sit a decade below the bound.
 
+## Step 4: one transformer layer
+
+```bash
+./build.sh && ./build/gotoken layer 504 2644 2643 335 260
+cd export && .venv/bin/python oracle.py step4 --tokens 504 2644 2643 335 260 --basic
+```
+
+`gotoken layer <id> [<id> ...]` runs layer 0 over a token sequence, token
+*i* at position *i*, and prints the last token's q and k after RoPE and the
+residual stream after the layer. The oracle registers a forward hook on
+`model.model.layers[0]`, runs the real model on the same ids, and compares
+the last position. q and k are checked against an independent numpy RoPE.
+
+| sequence            | q after RoPE | k after RoPE | layer output |
+|---------------------|-------------:|-------------:|-------------:|
+| ` cat`              | 3.9e-6       | 5.5e-6       | 1.5e-5       |
+| `The cat sat on the`| 4.0e-6       | 4.5e-6       | 5.7e-6       |
+| 14 tokens           | 6.5e-6       | 5.9e-6       | 1.5e-5       |
+
+(max abs error vs the reference; criterion `1e-4 + 1e-4 * |ref|`, passed
+with a decade to spare.)
+
+`TransformerLayer` in `src/forward.bm` is the body of the layer loop in
+run.c's `forward()`, and reads top to bottom as the layer's data flow:
+
+    xb  = rmsnorm(x)                  pre-norm: the sublayer sees unit-scale input
+    q, k, v = wq xb, wk xb, wv xb     projections
+    rope(q, k, position)              encode position as a rotation
+    cache[layer][position] = k, v     keep this position's k and v
+    for each head h:
+        scores[t] = q_h . k_{h/3}[t] / sqrt(64)   over t = 0..position
+        softmax(scores)
+        xb_h = sum_t scores[t] * v_{h/3}[t]
+    x += wo xb                        residual add
+    xb  = rmsnorm(x)                  pre-norm again
+    x += w2( silu(w1 xb) * (w3 xb) )  SwiGLU FFN, residual add
+
+**RoPE is a rotation, not an addition.** Each head's 64 floats are 32 pairs;
+pair *j* is rotated by the angle `position * theta^(-2j/64)`. Pair 0 turns
+fastest, pair 31 barely moves. Because a dot product of two rotated vectors
+depends only on the angle between them, `q(pos) . k(t)` depends on
+`pos - t`: relative position falls out of the geometry for free. This is why
+the position enters through q and k only, never through v or x. At position 0
+every angle is 0 and RoPE is the identity, which is why the single-token
+check is not enough and the check runs over a sequence.
+
+**GQA.** 9 query heads, 3 key/value heads. Query head *h* reads KV head
+`h \ 3`, so heads 0,1,2 share one k and v. That is the entire mechanism:
+`(h \ kvMul) * headDim` in the cache index. It cuts k and v to a third of the
+size, which matters because from step 6 on the KV cache is what fills memory
+as the sequence grows, and the quality cost of sharing is small.
+
+**The residual stream.** `x` is never overwritten inside a layer, only added
+to. Each sublayer reads a normalized copy, computes something, and adds it
+back. The norm before each sublayer (pre-norm) is what lets 30 of these
+stack without the scale of `x` running away: for ` cat` the rms of `x` goes
+from 0.08 to 2.5 through layer 0 alone.
+
+**Why the check takes a sequence.** The plan said one token at position 0.
+That passed, but with one token attention has one score, softmax makes it
+1.0, and the head output is just v, so the attention loop, softmax, the GQA
+mapping and RoPE were all running without being tested. A first attempt at
+a lone token at position 7 instead read seven never-written cache rows and
+failed against HuggingFace, which attends only to what exists. Feeding a
+real sequence makes every line of the layer count, while the reference is
+still just a hook on layer 0.
+
 ## Plan
 
 | step | what | checkpoint |
@@ -171,7 +238,7 @@ partial sum), and the observed errors sit a decade below the bound.
 | 1 | BASIC loader | first 5 floats match byte-exact (done) |
 | 2 | embedding lookup + tied output head | logits match Python for one token (done) |
 | 3 | matmul + RMSNorm kernels | match Python within ~1e-5 (done) |
-| 4 | one transformer layer at position 0 | layer-0 output matches a forward hook |
+| 4 | one transformer layer | layer-0 output matches a forward hook (done) |
 | 5 | full forward + greedy decode | token-for-token match with `transformers` |
 | 6 | KV cache | same output, measurably faster |
 | 7 | BPE tokenizer | round-trip matches Python tokenizer |

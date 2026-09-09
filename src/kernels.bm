@@ -44,3 +44,24 @@ SUB RmsNorm (o() AS SINGLE, x() AS SINGLE, woff AS LONG, size AS LONG)
         o(j) = w(woff + j) * (ss * x(j))
     NEXT
 END SUB
+
+' ---------------------------------------------------------------------------
+' Softmax: turn size scores starting at a(off) into probabilities, in place.
+' run.c's softmax(x, size). Subtracting the max first changes nothing
+' mathematically (it cancels in the division) but keeps EXP from overflowing.
+' ---------------------------------------------------------------------------
+SUB Softmax (a() AS SINGLE, start AS LONG, size AS LONG)
+    DIM i AS LONG, maxVal AS SINGLE, sum AS SINGLE
+    maxVal = a(start)
+    FOR i = 1 TO size - 1
+        IF a(start + i) > maxVal THEN maxVal = a(start + i)
+    NEXT
+    sum = 0
+    FOR i = 0 TO size - 1
+        a(start + i) = EXP(a(start + i) - maxVal)
+        sum = sum + a(start + i)
+    NEXT
+    FOR i = 0 TO size - 1
+        a(start + i) = a(start + i) / sum
+    NEXT
+END SUB

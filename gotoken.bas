@@ -4,6 +4,7 @@
 ' Usage:  gotoken                    model info + step 1 weight check
 '         gotoken logits <token_id>  step 2: logits for one token, no transformer
 '         gotoken kernels <token_id> step 3: RMSNorm and MatMul on layer 0, in isolation
+'         gotoken layer <id> [<id> ...]  step 4: layer 0 over a token sequence, output at the last
 ' Set GOTOKEN_WEIGHTS to use a weights.bin other than ./model/weights.bin.
 '
 ' Layout: QB64 has no modules, only textual includes. Declarations (.bi) go
@@ -18,7 +19,8 @@ OPTION _EXPLICIT
 '$INCLUDE: 'src/model.bi'
 '$INCLUDE: 'src/state.bi'
 
-DIM path AS STRING, cmd AS STRING, token AS LONG, t0 AS DOUBLE
+DIM path AS STRING, cmd AS STRING, token AS LONG, t0 AS DOUBLE, n AS LONG, i AS LONG
+REDIM tokens(0 TO 0) AS LONG
 
 ' Like run.c: the checkpoint path comes from outside. QB64 chdirs into the
 ' executable's folder at startup, so the default is resolved from the
@@ -50,6 +52,15 @@ SELECT CASE cmd
     CASE "kernels"
         PRINT "token"; token
         KernelCheck token
+    CASE "layer"
+        n = _COMMANDCOUNT - 1
+        IF n < 1 THEN Fail "layer needs at least one token id"
+        REDIM tokens(0 TO n - 1) AS LONG
+        FOR i = 0 TO n - 1
+            tokens(i) = VAL(COMMAND$(i + 2))
+            PRINT "token"; tokens(i); " at position"; i
+        NEXT
+        LayerCheck tokens(), n
     CASE ELSE
         Fail "unknown command: " + cmd
 END SELECT

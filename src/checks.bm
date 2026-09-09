@@ -93,3 +93,21 @@ SUB PrintVec (label AS STRING, v() AS SINGLE, n AS LONG)
         PRINT i; v(i); " "; FloatHex$(v(i))
     NEXT
 END SUB
+
+' Step 4: layer 0 over a short token sequence, token i at position i.
+' Prints q and k of the last token after RoPE and the layer output at the
+' last position. With one token attention is trivial (softmax of one score
+' is 1, so the output is just v); with several, every piece of the layer
+' matters, including the rotation making the scores depend on distance.
+SUB LayerCheck (tokens() AS LONG, n AS LONG)
+    DIM t0 AS DOUBLE, p AS LONG
+    t0 = TIMER(0.001)
+    FOR p = 0 TO n - 1
+        Embed tokens(p)
+        TransformerLayer 0, p
+    NEXT
+    PRINT "time layer"; TIMER(0.001) - t0; " for"; n; "positions"
+    PrintVec "q_rope", q(), cfg.modelDim
+    PrintVec "k_rope", k(), kvDim
+    PrintVec "layer0", x(), cfg.modelDim
+END SUB

@@ -11,6 +11,7 @@ Usage:
     python oracle.py step2 --token 9690           # reference logits for one token
     python oracle.py step2 --token 9690 --basic   # ...and compare with build/gotoken
     python oracle.py step3 --token 9690 --basic   # RMSNorm + MatMul in isolation vs BASIC
+    python oracle.py step4 --tokens 504 2644 2643 --basic  # layer 0 over a sequence vs a forward hook
 """
 
 import argparse
@@ -214,6 +215,74 @@ def compare_step3(model, tok, token_id: int, rtol: float = 1e-5, atol: float = 1
 
 
 # --------------------------------------------------------------------------- #
+# step 4: one transformer layer on one token, checked against a forward hook
+# --------------------------------------------------------------------------- #
+def rope_interleaved(vec: np.ndarray, position: int, head_dim: int, theta: float) -> np.ndarray:
+    """RoPE the way run.c and the BASIC engine apply it: adjacent pairs
+    (2j, 2j+1) of every head rotated by position * theta^(-2j/head_dim)."""
+    out = vec.copy()
+    n_heads = len(vec) // head_dim
+    j = np.arange(0, head_dim, 2)
+    ang = position / theta ** (j / head_dim)
+    cos, sin = np.cos(ang), np.sin(ang)
+    for h in range(n_heads):
+        seg = vec[h * head_dim:(h + 1) * head_dim]
+        a, b = seg[0::2], seg[1::2]
+        out[h * head_dim:(h + 1) * head_dim:2] = a * cos - b * sin
+        out[h * head_dim + 1:(h + 1) * head_dim:2] = a * sin + b * cos
+    return out
+
+
+def rope_theta(cfg) -> float:
+    """transformers >= 5 keeps it in rope_parameters, older versions on the config."""
+    rp = getattr(cfg, "rope_parameters", None)
+    return float(rp["rope_theta"] if rp else cfg.rope_theta)
+
+
+def step4_refs(model, tokens: list[int]) -> dict:
+    """Layer-0 output at the last position from a forward hook on the real
+    model run over the whole sequence, plus float64 references for the last
+    token's q and k after RoPE (built from step 3's pieces)."""
+    cfg = model.config
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    last, position = tokens[-1], len(tokens) - 1
+    refs3, weights = step3_refs(model, last)
+    xb = refs3["rmsnorm"]
+    refs = {
+        "q_rope": rope_interleaved(weights["wq"].astype(np.float64) @ xb, position, head_dim, rope_theta(cfg)),
+        "k_rope": rope_interleaved(weights["wk"].astype(np.float64) @ xb, position, head_dim, rope_theta(cfg)),
+    }
+
+    captured = {}
+
+    def hook(module, inputs, output):
+        captured["out"] = (output[0] if isinstance(output, tuple) else output).detach()
+
+    handle = model.model.layers[0].register_forward_hook(hook)
+    try:
+        with torch.no_grad():
+            model(input_ids=torch.tensor([tokens]))
+    finally:
+        handle.remove()
+    refs["layer0"] = captured["out"][0, -1].double().numpy()
+    return refs
+
+
+def compare_step4(model, tok, tokens: list[int], rtol: float = 1e-4, atol: float = 1e-4) -> bool:
+    refs = step4_refs(model, tokens)
+    got = parse_vectors(run_basic("layer", *tokens))
+    print(f"\ncompare BASIC layer 0 vs HF forward hook over {len(tokens)} tokens "
+          f"{[tok.convert_ids_to_tokens(t) for t in tokens]}, output at the last position")
+    print(f"  criterion: |basic - ref| <= {atol:g} + {rtol:g} * |ref|")
+    ok = all(compare_vec(n, got[n], refs[n], rtol, atol) for n in ["q_rope", "k_rope", "layer0"])
+    x_in = step3_refs(model, tokens[-1])[0]["x"]
+    print(f"  residual stream at the last position: |x_in| rms {np.sqrt((x_in ** 2).mean()):.4f} -> "
+          f"|x_out| rms {np.sqrt((refs['layer0'] ** 2).mean()):.4f}")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -225,6 +294,9 @@ def main() -> int:
     p = sub.add_parser("step3", help="RMSNorm and MatMul on layer 0, in isolation")
     p.add_argument("--token", type=int, required=True)
     p.add_argument("--basic", action="store_true", help="run build/gotoken kernels and compare")
+    p = sub.add_parser("step4", help="transformer layer 0 over a token sequence vs a forward hook")
+    p.add_argument("--tokens", type=int, nargs="+", required=True)
+    p.add_argument("--basic", action="store_true", help="run build/gotoken layer and compare")
     args = ap.parse_args()
 
     tok = load_tokenizer()
@@ -245,6 +317,12 @@ def main() -> int:
             print(f"{name:<8} n={len(v):4d}  first 4: {np.array2string(v[:4], precision=7)}")
         if args.basic:
             return 0 if compare_step3(model, tok, args.token) else 1
+    if args.cmd == "step4":
+        refs = step4_refs(model, args.tokens)
+        for name, v in refs.items():
+            print(f"{name:<8} n={len(v):4d}  first 4: {np.array2string(v[:4], precision=7)}")
+        if args.basic:
+            return 0 if compare_step4(model, tok, args.tokens) else 1
     return 0
 
 

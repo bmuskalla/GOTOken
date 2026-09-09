@@ -2,12 +2,21 @@
 ' forward(). Step 2: embedding lookup and the output head, no transformer.
 
 SUB AllocRunState
-    REDIM x(0 TO cfg.modelDim - 1) AS SINGLE
-    REDIM xb(0 TO cfg.modelDim - 1) AS SINGLE
-    REDIM q(0 TO cfg.modelDim - 1) AS SINGLE
+    DIM d AS LONG
+    d = cfg.modelDim
+    maxSeq = 1024 ' the model allows cfg.seqLen (8192); this keeps the caches at 47 MB
+    REDIM x(0 TO d - 1) AS SINGLE
+    REDIM xb(0 TO d - 1) AS SINGLE
+    REDIM xb2(0 TO d - 1) AS SINGLE
+    REDIM q(0 TO d - 1) AS SINGLE
     REDIM k(0 TO kvDim - 1) AS SINGLE
+    REDIM v(0 TO kvDim - 1) AS SINGLE
+    REDIM att(0 TO cfg.nHeads * maxSeq - 1) AS SINGLE
     REDIM hb(0 TO cfg.hiddenDim - 1) AS SINGLE
+    REDIM hb2(0 TO cfg.hiddenDim - 1) AS SINGLE
     REDIM logits(0 TO cfg.vocabSize - 1) AS SINGLE
+    REDIM keyCache(0 TO cfg.nLayers * maxSeq * kvDim - 1) AS SINGLE
+    REDIM valueCache(0 TO cfg.nLayers * maxSeq * kvDim - 1) AS SINGLE
 END SUB
 
 ' ---------------------------------------------------------------------------
@@ -33,4 +42,112 @@ END SUB
 ' ---------------------------------------------------------------------------
 SUB Classify
     MatMul logits(), x(), offWcls, cfg.modelDim, cfg.vocabSize
+END SUB
+
+' ---------------------------------------------------------------------------
+' Rope: rotate q and k in place for position position.
+'
+' Each head's 64 floats are treated as 32 complex numbers (adjacent pairs,
+' thanks to the export-time row permutation). Pair j is rotated by the angle
+' position * freq_j, with freq_j = theta^(-2j/head_dim): pair 0 turns fastest,
+' the last pair barely moves. Positions are encoded as a rotation, not an
+' addition, so the dot product of a rotated q with a rotated k depends only
+' on how far apart the two positions are.
+'
+' run.c's RoPE loop, with 10000 replaced by the header's rope_theta.
+' Both q and k are rotated for i < kv_dim, only q beyond that (GQA: k is
+' shorter than q).
+' ---------------------------------------------------------------------------
+SUB Rope (position AS LONG)
+    DIM i AS LONG, j AS LONG, freq AS DOUBLE, angle AS DOUBLE
+    DIM fcr AS SINGLE, fci AS SINGLE, v0 AS SINGLE, v1 AS SINGLE
+    FOR i = 0 TO cfg.modelDim - 1 STEP 2
+        j = i MOD headDim '                  index within this head
+        freq = 1 / (cfg.ropeTheta ^ (j / CDBL(headDim)))
+        angle = position * freq
+        fcr = COS(angle)
+        fci = SIN(angle)
+        v0 = q(i): v1 = q(i + 1)
+        q(i) = v0 * fcr - v1 * fci
+        q(i + 1) = v0 * fci + v1 * fcr
+        IF i < kvDim THEN
+            v0 = k(i): v1 = k(i + 1)
+            k(i) = v0 * fcr - v1 * fci
+            k(i + 1) = v0 * fci + v1 * fcr
+        END IF
+    NEXT
+END SUB
+
+' ---------------------------------------------------------------------------
+' TransformerLayer: run layer l on the token in x() at position position.
+' x() is the residual stream; the layer adds two things to it, an attention
+' output and an FFN output, each computed from a normalized copy of x.
+' Mirrors the body of the layer loop in run.c's forward().
+' ---------------------------------------------------------------------------
+SUB TransformerLayer (l AS LONG, position AS LONG)
+    DIM d AS LONG, i AS LONG, t AS LONG, h AS LONG
+    DIM loff AS LONG, rowOff AS LONG, qOff AS LONG, attOff AS LONG
+    DIM score AS SINGLE, a AS SINGLE, acc AS SINGLE
+    d = cfg.modelDim
+    loff = l * maxSeq * kvDim ' this layer's slab of the caches
+
+    ' --- attention sublayer ------------------------------------------------
+    RmsNorm xb(), x(), offRmsAtt(l), d
+
+    MatMul q(), xb(), offWq(l), d, d
+    MatMul k(), xb(), offWk(l), d, kvDim
+    MatMul v(), xb(), offWv(l), d, kvDim
+    Rope position
+
+    ' this position's k and v become row position of the layer's cache
+    rowOff = loff + position * kvDim
+    FOR i = 0 TO kvDim - 1
+        keyCache(rowOff + i) = k(i)
+        valueCache(rowOff + i) = v(i)
+    NEXT
+
+    ' Multi-head attention. Head h of q attends over rows 0..position of the cache,
+    ' using KV head h \ kvMul: with 9 query heads and 3 KV heads, query heads
+    ' 0,1,2 share KV head 0, and so on. That is all GQA is.
+    FOR h = 0 TO cfg.nHeads - 1
+        qOff = h * headDim
+        attOff = h * maxSeq
+        FOR t = 0 TO position
+            rowOff = loff + t * kvDim + (h \ kvMul) * headDim
+            score = 0
+            FOR i = 0 TO headDim - 1
+                score = score + q(qOff + i) * keyCache(rowOff + i)
+            NEXT
+            att(attOff + t) = score / SQR(headDim)
+        NEXT
+        Softmax att(), attOff, position + 1
+        ' weighted sum of the values, written into xb (reused as the output buffer)
+        FOR i = 0 TO headDim - 1
+            acc = 0
+            FOR t = 0 TO position
+                a = att(attOff + t)
+                acc = acc + a * valueCache(loff + t * kvDim + (h \ kvMul) * headDim + i)
+            NEXT
+            xb(qOff + i) = acc
+        NEXT
+    NEXT
+
+    MatMul xb2(), xb(), offWo(l), d, d
+    FOR i = 0 TO d - 1
+        x(i) = x(i) + xb2(i) ' residual connection
+    NEXT
+
+    ' --- feed-forward sublayer (SwiGLU) ------------------------------------
+    RmsNorm xb(), x(), offRmsFfn(l), d
+    MatMul hb(), xb(), offW1(l), d, cfg.hiddenDim '  gate
+    MatMul hb2(), xb(), offW3(l), d, cfg.hiddenDim ' up
+    FOR i = 0 TO cfg.hiddenDim - 1
+        a = hb(i)
+        a = a * (1 / (1 + EXP(-a))) ' silu(gate)
+        hb(i) = a * hb2(i) '          * up
+    NEXT
+    MatMul xb(), hb(), offW2(l), cfg.hiddenDim, d ' down
+    FOR i = 0 TO d - 1
+        x(i) = x(i) + xb(i) ' residual connection
+    NEXT
 END SUB
