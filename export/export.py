@@ -26,10 +26,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 from huggingface_hub import snapshot_download
-from safetensors import safe_open
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 MAGIC = 0x4B4F5447  # the bytes b"GTOK" read as a little-endian INT32
@@ -118,15 +116,52 @@ def layer_tensors(i: int, c: dict) -> list[tuple[str, str, int | None]]:
     ]
 
 
-def to_f32(t: torch.Tensor) -> np.ndarray:
-    # bf16 -> fp32 is exact: same 8-bit exponent, mantissa padded with 16 zero bits.
-    return np.ascontiguousarray(t.to(torch.float32).numpy().astype(F32))
+class SafeTensors:
+    """Just enough of the safetensors format: an 8-byte little-endian header
+    length, a JSON header mapping tensor name -> {dtype, shape, data_offsets},
+    then the raw tensor bytes. Plain file reads, no ML framework."""
+
+    def __init__(self, path: Path):
+        self.f = open(path, "rb")
+        (n,) = struct.unpack("<Q", self.f.read(8))
+        self.header = json.loads(self.f.read(n))
+        self.header.pop("__metadata__", None)
+        self.base = 8 + n
+
+    def keys(self) -> list[str]:
+        return list(self.header)
+
+    def get(self, name: str) -> np.ndarray:
+        meta = self.header[name]
+        start, end = meta["data_offsets"]
+        self.f.seek(self.base + start)
+        raw = self.f.read(end - start)
+        return to_f32(raw, meta["dtype"]).reshape(meta["shape"])
+
+    def close(self):
+        self.f.close()
+
+
+def to_f32(raw: bytes, dtype: str) -> np.ndarray:
+    """Raw little-endian tensor bytes -> fp32 numpy array.
+
+    bf16 -> fp32 is exact: bf16 is simply the top 16 bits of an fp32 (same sign
+    and 8-bit exponent, 7 mantissa bits instead of 23), so the conversion is a
+    16-bit left shift that pads the mantissa with zeros."""
+    if dtype == "BF16":
+        return (np.frombuffer(raw, dtype="<u2").astype("<u4") << 16).view(F32)
+    if dtype == "F16":
+        return np.frombuffer(raw, dtype="<f2").astype(F32)
+    if dtype == "F32":
+        return np.frombuffer(raw, dtype=F32).copy()
+    raise ValueError(f"unsupported dtype {dtype}")
 
 
 def export_weights(model_dir: Path, c: dict, out_path: Path) -> np.ndarray:
     """Write weights.bin.  Returns the fp32 embedding table for the checkpoint print."""
     written = 0
-    with safe_open(model_dir / "model.safetensors", framework="pt") as f, open(out_path, "wb") as out:
+    f = SafeTensors(model_dir / "model.safetensors")
+    with open(out_path, "wb") as out:
         out.write(pack_header(c))
 
         def put(name: str, arr: np.ndarray, expect: tuple):
@@ -136,7 +171,7 @@ def export_weights(model_dir: Path, c: dict, out_path: Path) -> np.ndarray:
             out.write(arr.tobytes())
             written += arr.size
 
-        emb = to_f32(f.get_tensor("model.embed_tokens.weight"))
+        emb = f.get("model.embed_tokens.weight")
         put("token_embedding", emb, (c["vocab_size"], c["dim"]))
 
         dim, hd, kv = c["dim"], c["hidden_dim"], c["n_kv_heads"] * (c["dim"] // c["n_heads"])
@@ -144,19 +179,20 @@ def export_weights(model_dir: Path, c: dict, out_path: Path) -> np.ndarray:
                   "wo": (dim, dim), "rms_ffn": (dim,), "w1": (hd, dim), "w2": (dim, hd), "w3": (hd, dim)}
         for i in range(c["n_layers"]):
             for name, role, permute_heads in layer_tensors(i, c):
-                arr = to_f32(f.get_tensor(name))
+                arr = f.get(name)
                 if permute_heads:
                     arr = np.ascontiguousarray(permute_for_interleaved_rope(arr, permute_heads))
                 put(name, arr, shapes[role])
             print(f"  layer {i:2d} written", end="\r", flush=True)
         print()
 
-        put("model.norm.weight", to_f32(f.get_tensor("model.norm.weight")), (dim,))
+        put("model.norm.weight", f.get("model.norm.weight"), (dim,))
         if not c["tied"]:
-            put("lm_head.weight", to_f32(f.get_tensor("lm_head.weight")), (c["vocab_size"], dim))
+            put("lm_head.weight", f.get("lm_head.weight"), (c["vocab_size"], dim))
 
         leftover = sorted(k for k in f.keys() if k not in _expected_keys(c))
         assert not leftover, f"unexported tensors: {leftover}"
+    f.close()
 
     print(f"  {written:,} parameters -> {out_path} ({out_path.stat().st_size:,} bytes)")
     return emb
@@ -175,9 +211,10 @@ def check_rope_permutation(model_dir: Path, c: dict) -> None:
     """Numerically prove the Q/K row permutation is harmless: HF-style RoPE on the
     original projections and llama2.c-style RoPE on the permuted ones must give
     identical q.k attention scores for every head."""
-    with safe_open(model_dir / "model.safetensors", framework="pt") as f:
-        wq = to_f32(f.get_tensor("model.layers.0.self_attn.q_proj.weight")).astype(np.float64)
-        wk = to_f32(f.get_tensor("model.layers.0.self_attn.k_proj.weight")).astype(np.float64)
+    f = SafeTensors(model_dir / "model.safetensors")
+    wq = f.get("model.layers.0.self_attn.q_proj.weight").astype(np.float64)
+    wk = f.get("model.layers.0.self_attn.k_proj.weight").astype(np.float64)
+    f.close()
     n_heads, n_kv = c["n_heads"], c["n_kv_heads"]
     head_dim = c["dim"] // n_heads
     rng = np.random.default_rng(0)
@@ -314,7 +351,7 @@ def export_tokenizer(model_dir: Path, c: dict, out_path: Path) -> list[bytes]:
 
 def check_tokenizer_roundtrip(model_dir: Path, tokens: list[bytes]) -> None:
     """Byte-level BPE is lossless: HF ids -> our bytes must rebuild the text."""
-    tok = AutoTokenizer.from_pretrained(model_dir)
+    tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
     samples = [
         "Hello world",
         "The quick brown fox jumps over the lazy dog.",
@@ -323,7 +360,7 @@ def check_tokenizer_roundtrip(model_dir: Path, tokens: list[bytes]) -> None:
         "def main():\n    return 0\n",
     ]
     for s in samples:
-        ids = tok.encode(s, add_special_tokens=False)
+        ids = tok.encode(s, add_special_tokens=False).ids
         rebuilt = b"".join(tokens[i] for i in ids).decode("utf-8")
         assert rebuilt == s, (s, ids, rebuilt)
     print(f"  tokenizer round-trip: {len(samples)} strings rebuilt byte-exact from HF ids")

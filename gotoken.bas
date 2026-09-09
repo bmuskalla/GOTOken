@@ -1,7 +1,7 @@
 ' GOTOken - an LLM inference engine in BASIC, running SmolLM2-135M.
 ' Follows karpathy's llama2.c run.c as closely as the language allows.
 '
-' Usage:  gotoken                    model info + step 1 weight check
+' Usage:  gotoken [info]             model info + step 1 weight check
 '         gotoken logits <token_id>  step 2: logits for one token, no transformer
 '         gotoken kernels <token_id> step 3: RMSNorm and MatMul on layer 0, in isolation
 '         gotoken layer <id> [<id> ...]  step 4: layer 0 over a token sequence, output at the last
@@ -11,7 +11,7 @@
 '         gotoken encode "<text>"              step 7: text -> token ids (and the chunks)
 '         gotoken decode <id> [<id> ...]       step 7: token ids -> text
 '         gotoken encode-batch <file>          step 7: many strings (INT32 count; INT32 len + bytes each)
-'         gotoken complete <steps> "<text>"    step 7: greedy completion of a text prompt
+'         gotoken complete <max_tokens> "<text>"  step 7: complete a text prompt (greedy, stops at end of text)
 '         gotoken sample <steps> <temp> <topp> <topk> <seed> <id> [...]  step 8: sampled decode
 '         gotoken repl [temp] [topp] [topk] [seed]   step 8: interactive; /temp /topp /topk /seed /steps /quit
 ' Set GOTOKEN_WEIGHTS / GOTOKEN_TOKENIZER to use files other than ./model/*.bin.
@@ -59,7 +59,7 @@ END IF
 
 token = VAL(COMMAND$(2))
 SELECT CASE cmd
-    CASE ""
+    CASE "", "info"
         PrintModelInfo
         PrintWeightCheck
     CASE "logits"
@@ -137,13 +137,9 @@ SELECT CASE cmd
         text = COMMAND$(3)
         Encode text, tokens(), n
         IF n < 1 THEN Fail "empty prompt"
-        PRINT "prompt ids:";
-        FOR i = 0 TO n - 1
-            PRINT tokens(i);
-        NEXT
-        PRINT
+        genStream = 1
+        PRINT text;
         Generate tokens(), n, VAL(COMMAND$(2)), 1
-        PRINT "text: "; Decode$(genSeq(), genLen)
     CASE "sample"
         n = _COMMANDCOUNT - 6
         IF n < 1 THEN Fail "sample needs <steps> <temp> <topp> <topk> <seed> and token ids"
@@ -162,6 +158,7 @@ SELECT CASE cmd
         IF COMMAND$(5) <> "" THEN rngState = VAL(COMMAND$(5))
         steps = 64
         genStream = 1
+        PRINT "GOTOken: SmolLM2-135M in BASIC. Type a prompt and press enter; /quit to leave."
         PRINT "temperature"; samplerTemperature; " top-p"; samplerTopP; " top-k"; samplerTopK; " steps"; steps
         k = 0 ' consecutive empty lines; three in a row ends the session (piped input has no EOF here)
         DO

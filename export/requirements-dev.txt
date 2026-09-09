@@ -1,0 +1,8 @@
+-r requirements.txt
+# the Python oracle: verifies the engine against the real model
+torch>=2.2
+transformers>=4.44
+notebook
+nbconvert
+ipykernel
+nbformat

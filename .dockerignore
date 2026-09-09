@@ -1,0 +1,7 @@
+.git
+build
+model
+export/.venv
+export/oracle.ipynb
+**/__pycache__
+**/.ipynb_checkpoints
