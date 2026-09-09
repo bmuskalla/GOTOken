@@ -151,3 +151,19 @@ SUB TransformerLayer (l AS LONG, position AS LONG)
         x(i) = x(i) + xb(i) ' residual connection
     NEXT
 END SUB
+
+' ---------------------------------------------------------------------------
+' Forward: the whole model on one token at one position. run.c's forward():
+' embed, every layer, final norm, classifier. Leaves the next-token scores
+' in logits(). Attention inside each layer reads the cache rows 0..position,
+' so the earlier positions must have been forwarded before this one.
+' ---------------------------------------------------------------------------
+SUB Forward (token AS LONG, position AS LONG)
+    DIM l AS LONG
+    Embed token
+    FOR l = 0 TO cfg.nLayers - 1
+        TransformerLayer l, position
+    NEXT
+    RmsNorm x(), x(), offRmsFinal, cfg.modelDim ' in place, like run.c
+    Classify
+END SUB

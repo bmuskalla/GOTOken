@@ -37,7 +37,7 @@ SUB PrintLogits (k AS LONG)
     DIM i AS LONG, r AS LONG, best AS LONG
     REDIM taken(0 TO cfg.vocabSize - 1) AS _BYTE
     FOR i = 0 TO 4
-        PRINT "logit"; i; logits(i)
+        PRINT "logit"; i; " "; logits(i)
     NEXT
     FOR r = 1 TO k
         best = -1
@@ -51,7 +51,7 @@ SUB PrintLogits (k AS LONG)
             END IF
         NEXT
         taken(best) = 1
-        PRINT "top"; r; " id"; best; " logit"; logits(best)
+        PRINT "top"; r; " id"; best; " logit "; logits(best)
     NEXT
 END SUB
 

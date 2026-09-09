@@ -5,6 +5,8 @@
 '         gotoken logits <token_id>  step 2: logits for one token, no transformer
 '         gotoken kernels <token_id> step 3: RMSNorm and MatMul on layer 0, in isolation
 '         gotoken layer <id> [<id> ...]  step 4: layer 0 over a token sequence, output at the last
+'         gotoken forward <id> [<id> ...]      step 5: full forward, logits at the last position
+'         gotoken generate <steps> <id> [...]  step 5: greedy decode from the prompt ids
 ' Set GOTOKEN_WEIGHTS to use a weights.bin other than ./model/weights.bin.
 '
 ' Layout: QB64 has no modules, only textual includes. Declarations (.bi) go
@@ -61,6 +63,27 @@ SELECT CASE cmd
             PRINT "token"; tokens(i); " at position"; i
         NEXT
         LayerCheck tokens(), n
+    CASE "forward"
+        n = _COMMANDCOUNT - 1
+        IF n < 1 THEN Fail "forward needs at least one token id"
+        REDIM tokens(0 TO n - 1) AS LONG
+        FOR i = 0 TO n - 1
+            tokens(i) = VAL(COMMAND$(i + 2))
+        NEXT
+        t0 = TIMER(0.001)
+        FOR i = 0 TO n - 1
+            Forward tokens(i), i
+        NEXT
+        PRINT "forwarded"; n; "positions in"; TIMER(0.001) - t0; "s"
+        PrintLogits 5
+    CASE "generate"
+        n = _COMMANDCOUNT - 2
+        IF n < 1 THEN Fail "generate needs <steps> and at least one token id"
+        REDIM tokens(0 TO n - 1) AS LONG
+        FOR i = 0 TO n - 1
+            tokens(i) = VAL(COMMAND$(i + 3))
+        NEXT
+        Generate tokens(), n, VAL(COMMAND$(2))
     CASE ELSE
         Fail "unknown command: " + cmd
 END SELECT
@@ -70,4 +93,5 @@ SYSTEM
 '$INCLUDE: 'src/model.bm'
 '$INCLUDE: 'src/kernels.bm'
 '$INCLUDE: 'src/forward.bm'
+'$INCLUDE: 'src/generate.bm'
 '$INCLUDE: 'src/checks.bm'

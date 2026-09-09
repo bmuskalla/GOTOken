@@ -12,6 +12,7 @@ Usage:
     python oracle.py step2 --token 9690 --basic   # ...and compare with build/gotoken
     python oracle.py step3 --token 9690 --basic   # RMSNorm + MatMul in isolation vs BASIC
     python oracle.py step4 --tokens 504 2644 2643 --basic  # layer 0 over a sequence vs a forward hook
+    python oracle.py step5 --tokens 504 2644 2643 --steps 8 --basic  # full forward + greedy decode
 """
 
 import argparse
@@ -81,9 +82,9 @@ def run_basic(*args: str) -> str:
 
 
 def parse_step2(text: str) -> dict:
-    first = {int(m[1]): float(m[2]) for m in re.finditer(r"^logit\s+(\d+)\s+(\S+)", text, re.M)}
+    first = {int(m[1]): float(m[2]) for m in re.finditer(r"^logit\s+(\d+)\s*(\S+)", text, re.M)}
     top = [(int(m[1]), int(m[2]), float(m[3]))
-           for m in re.finditer(r"^top\s+(\d+)\s+id\s+(\d+)\s+logit\s+(\S+)", text, re.M)]
+           for m in re.finditer(r"^top\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)", text, re.M)]
     assert len(first) == 5 and top, f"could not parse BASIC output:\n{text}"
     return {"first": first, "top": top}
 
@@ -283,6 +284,81 @@ def compare_step4(model, tok, tokens: list[int], rtol: float = 1e-4, atol: float
 
 
 # --------------------------------------------------------------------------- #
+# step 5: full forward and greedy decoding
+# --------------------------------------------------------------------------- #
+def step5_logits(model, tokens: list[int]) -> np.ndarray:
+    """Next-token logits after the whole model, at the last position."""
+    with torch.no_grad():
+        return model(input_ids=torch.tensor([tokens])).logits[0, -1].double().numpy()
+
+
+def step5_greedy(model, tokens: list[int], steps: int) -> list[dict]:
+    """Greedy decoding done the slow, obvious way (whole sequence re-forwarded
+    per token, like the BASIC engine in step 5) so we can record the margin
+    between the best and second-best logit at every step. Cross-checked
+    against model.generate."""
+    seq = list(tokens)
+    out = []
+    for _ in range(steps):
+        logits = step5_logits(model, seq)
+        top2 = np.argsort(-logits)[:2]
+        out.append({"id": int(top2[0]), "logit": logits[top2[0]], "margin": logits[top2[0]] - logits[top2[1]]})
+        seq.append(int(top2[0]))
+    with torch.no_grad():
+        gen = model.generate(torch.tensor([tokens]), max_new_tokens=steps, do_sample=False,
+                             pad_token_id=model.config.eos_token_id)
+    hf_ids = gen[0, len(tokens):].tolist()
+    ours = [o["id"] for o in out][: len(hf_ids)]
+    assert hf_ids == ours, f"manual greedy {ours} != model.generate {hf_ids}"
+    return out
+
+
+def parse_step5_gen(text: str) -> list[dict]:
+    return [{"id": int(m[2]), "logit": float(m[3]), "margin": float(m[4]), "secs": float(m[5].replace("D", "E"))}
+            for m in re.finditer(r"^gen\s+(\d+)\s+id\s+(\d+)\s+logit\s*(\S+)\s+margin\s*(\S+)\s+forwards\s+\d+\s+secs\s*(\S+)", text, re.M)]
+
+
+def compare_step5(model, tok, tokens: list[int], steps: int, rtol: float = 1e-3, atol: float = 1e-3) -> bool:
+    ok = True
+    # 1. logits after the full forward
+    ref = step5_logits(model, tokens)
+    got = parse_step2(run_basic("forward", *tokens))
+    print(f"\nfull forward over {[tok.convert_ids_to_tokens(t) for t in tokens]}: logits at the last position")
+    print(f"  criterion: |basic - ref| <= {atol:g} + {rtol:g} * |ref|")
+    for i, v in got["first"].items():
+        d = abs(v - ref[i])
+        flag = "ok" if d <= atol + rtol * abs(ref[i]) else "MISMATCH"
+        ok &= flag == "ok"
+        print(f"  logit {i}: basic {v:.6f}  oracle {ref[i]:.6f}  diff {d:.1e}  {flag}")
+    ref_top = np.argsort(-ref)[: len(got["top"])]
+    for (r, vid, val), rid in zip(got["top"], ref_top):
+        d = abs(val - ref[vid])
+        flag = "ok" if vid == rid and d <= atol + rtol * abs(ref[vid]) else "MISMATCH"
+        ok &= flag == "ok"
+        print(f"  top {r}: basic id {vid} {val:.6f}  oracle id {rid} {ref[rid]:.6f}  diff {d:.1e}  {tok.convert_ids_to_tokens(int(rid))!r}  {flag}")
+
+    # 2. greedy decoding, token for token
+    ref_gen = step5_greedy(model, tokens, steps)
+    text = run_basic("generate", steps, *tokens)
+    got_gen = parse_step5_gen(text)
+    print(f"\ngreedy decode, {steps} tokens")
+    for s, (g, r) in enumerate(zip(got_gen, ref_gen)):
+        flag = "ok" if g["id"] == r["id"] else "MISMATCH"
+        ok &= flag == "ok"
+        print(f"  step {s}: basic {g['id']:6d} {tok.convert_ids_to_tokens(g['id'])!r:<14} oracle {r['id']:6d}"
+              f"  logit diff {abs(g['logit'] - r['logit']):.1e}  margin {r['margin']:.3f}  {g['secs']:.1f}s  {flag}")
+    ok &= len(got_gen) == len(ref_gen)
+    ids = tokens + [r["id"] for r in ref_gen]
+    print(f"  smallest margin {min(r['margin'] for r in ref_gen):.3f}")
+    print(f"  text: {tok.decode(tokens)!r} -> {tok.decode(ids[len(tokens):])!r}")
+    m = re.search(r"generated\s+\d+\s+tokens with\s+(\d+)\s+forwards in\s+(\S+)", text)
+    if m:
+        print(f"  BASIC: {m[1]} forwards in {float(m[2]):.1f}s, {steps / float(m[2]):.2f} tok/s")
+    print("PASS" if ok else "FAIL")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -297,6 +373,10 @@ def main() -> int:
     p = sub.add_parser("step4", help="transformer layer 0 over a token sequence vs a forward hook")
     p.add_argument("--tokens", type=int, nargs="+", required=True)
     p.add_argument("--basic", action="store_true", help="run build/gotoken layer and compare")
+    p = sub.add_parser("step5", help="full forward + greedy decode vs transformers")
+    p.add_argument("--tokens", type=int, nargs="+", required=True)
+    p.add_argument("--steps", type=int, default=8)
+    p.add_argument("--basic", action="store_true", help="run build/gotoken forward/generate and compare")
     args = ap.parse_args()
 
     tok = load_tokenizer()
@@ -323,6 +403,14 @@ def main() -> int:
             print(f"{name:<8} n={len(v):4d}  first 4: {np.array2string(v[:4], precision=7)}")
         if args.basic:
             return 0 if compare_step4(model, tok, args.tokens) else 1
+    if args.cmd == "step5":
+        ref = step5_logits(model, args.tokens)
+        for r, v in enumerate(np.argsort(-ref)[:5], 1):
+            print(f"top {r} id {v} logit {ref[v]:.6f}   {tok.convert_ids_to_tokens(int(v))!r}")
+        for s_, g in enumerate(step5_greedy(model, args.tokens, args.steps)):
+            print(f"gen {s_} id {g['id']} logit {g['logit']:.6f} margin {g['margin']:.3f}   {tok.convert_ids_to_tokens(g['id'])!r}")
+        if args.basic:
+            return 0 if compare_step5(model, tok, args.tokens, args.steps) else 1
     return 0
 
 

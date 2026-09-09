@@ -1,0 +1,53 @@
+' generate.bm - turning next-token scores into text, one token at a time.
+
+' The two largest logits. best is the greedy choice; the gap to second is
+' how much numerical headroom the choice had.
+SUB BestTwo (best AS LONG, second AS LONG)
+    DIM i AS LONG
+    best = 0: second = -1
+    FOR i = 1 TO cfg.vocabSize - 1
+        IF logits(i) > logits(best) THEN
+            second = best
+            best = i
+        ELSEIF second < 0 THEN
+            second = i
+        ELSEIF logits(i) > logits(second) THEN
+            second = i
+        END IF
+    NEXT
+END SUB
+
+' ---------------------------------------------------------------------------
+' Generate: greedy decoding. Feed the prompt, take the argmax, append it,
+' repeat. That loop is autoregression: the model only ever predicts one next
+' token, and text comes from feeding its own output back in.
+'
+' Step 5 keeps nothing between tokens: for every new token the whole sequence
+' is forwarded again from position 0, so token s costs nPrompt + s forwards.
+' Step 6 keeps the caches and forwards only the new position.
+' ---------------------------------------------------------------------------
+SUB Generate (prompt() AS LONG, nPrompt AS LONG, nSteps AS LONG)
+    DIM n AS LONG, s AS LONG, p AS LONG, best AS LONG, second AS LONG
+    DIM t0 AS DOUBLE, tStart AS DOUBLE, forwards AS LONG
+    REDIM seq(0 TO nPrompt + nSteps - 1) AS LONG
+    FOR p = 0 TO nPrompt - 1
+        seq(p) = prompt(p)
+    NEXT
+    n = nPrompt
+    tStart = TIMER(0.001)
+    forwards = 0
+    FOR s = 0 TO nSteps - 1
+        t0 = TIMER(0.001)
+        FOR p = 0 TO n - 1 ' the whole sequence, every time (no KV cache yet)
+            Forward seq(p), p
+        NEXT
+        forwards = forwards + n
+        BestTwo best, second
+        ' PRINT puts a space before positive numbers but not negative ones, so
+        ' every label ends in an explicit space or the parser sees "logit-0.48".
+        PRINT "gen"; s; " id"; best; " logit "; logits(best); " margin "; logits(best) - logits(second); " forwards"; n; " secs "; TIMER(0.001) - t0
+        seq(n) = best
+        n = n + 1
+    NEXT
+    PRINT "generated"; nSteps; "tokens with"; forwards; "forwards in"; TIMER(0.001) - tStart; "s"
+END SUB

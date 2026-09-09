@@ -29,7 +29,8 @@ relative to the including file.
     src/model.bm    LoadModel, MapWeights
     src/state.bi    activations of the current forward pass (run.c RunState)
     src/kernels.bm  MatMul, RmsNorm, Softmax
-    src/forward.bm  Embed, Rope, TransformerLayer, Classify (grows into run.c's forward)
+    src/forward.bm  Embed, Rope, TransformerLayer, Forward, Classify
+    src/generate.bm Generate (greedy decoding), BestTwo
     src/checks.bm   checkpoint printers in a format oracle.py parses
     src/util.bm     FloatHex$, Fail
 
@@ -230,6 +231,64 @@ failed against HuggingFace, which attends only to what exists. Feeding a
 real sequence makes every line of the layer count, while the reference is
 still just a hook on layer 0.
 
+## Step 5: full forward and greedy decoding
+
+```bash
+./build.sh
+./build/gotoken forward 504 2644 2643 335 260        # logits after all 30 layers
+./build/gotoken generate 8 504 2644 2643 335 260     # greedy, 8 new tokens
+cd export && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --steps 8 --basic
+```
+
+`Forward` in `src/forward.bm` is now run.c's `forward()`: embed, 30 layers,
+final RMSNorm, classifier. `Generate` in `src/generate.bm` is the
+autoregressive loop: forward the sequence, take the argmax, append it,
+repeat. Prompts are token ids for now (`oracle.py encode "text"` gives
+them); the tokenizer is step 7.
+
+The oracle checks two things. The logits at the last prompt position
+against the real model after all 30 layers:
+
+| prompt               | max logit diff | top-5 ids |
+|----------------------|---------------:|-----------|
+| `The cat sat on the` | 1.7e-5         | identical |
+
+And greedy decoding token for token against `model.generate(do_sample=False)`:
+
+| prompt                            | continuation                       | steps | smallest margin |
+|-----------------------------------|------------------------------------|------:|----------------:|
+| `The cat sat on the`              | ` bed, and the cat sat on the`     | 8/8   | 0.189           |
+| `Once upon a time, there was a`   | ` little girl named Lily. She`     | 6/6   | 0.317           |
+
+**Greedy is the oracle because it is deterministic.** Sampling would make
+two correct engines disagree by design. Argmax makes them agree exactly, as
+long as the fp32 drift (about 1e-5 on the logits after 30 layers) stays
+smaller than the gap between the best and second-best logit. That gap is
+the `margin` column: the smallest was 0.19, four orders of magnitude above
+the drift. A near-tie could flip a token in a perfectly correct engine, so
+a mismatch is a bug only if the margin was comfortable, and the oracle
+prints it for every step.
+
+**Autoregression is the whole loop.** The model never produces text; it
+produces one distribution over the next token, and `Generate` feeds its own
+argmax back in. Note the first prompt: after ` bed,` the model walks
+straight back into ` and the cat sat on the`. That is what a 135M model's
+greedy decoding looks like, and step 8's sampler exists to do better.
+
+**No KV cache yet, and it shows.** Every new token re-forwards the entire
+sequence from position 0, so step *s* costs `n_prompt + s` forwards. The
+per-step time in the oracle output climbs linearly, 4.8 s to 11.5 s over 8
+steps, for 68 forwards and 0.12 tokens/s. A single forward is 0.95 s in
+unoptimized QB64 output (no `-O` flags, bounds checks on). Step 6 removes
+the quadratic term; the linear per-forward cost is step 9's problem.
+
+**A bug that was not one.** The second prompt first reported a mismatch at
+` Lily`. The engine had produced it; its logit was negative, and BASIC's
+`PRINT` puts no space before a negative number, so the line read
+`logit-.4843422` and the parser dropped it. Labels now end in an explicit
+space. Worth knowing: the greedy pick can have a negative logit, logits are
+scores, not probabilities.
+
 ## Plan
 
 | step | what | checkpoint |
@@ -239,7 +298,7 @@ still just a hook on layer 0.
 | 2 | embedding lookup + tied output head | logits match Python for one token (done) |
 | 3 | matmul + RMSNorm kernels | match Python within ~1e-5 (done) |
 | 4 | one transformer layer | layer-0 output matches a forward hook (done) |
-| 5 | full forward + greedy decode | token-for-token match with `transformers` |
+| 5 | full forward + greedy decode | token-for-token match with `transformers` (done) |
 | 6 | KV cache | same output, measurably faster |
 | 7 | BPE tokenizer | round-trip matches Python tokenizer |
 | 8 | sampler + REPL | temp 0 reproduces greedy |
