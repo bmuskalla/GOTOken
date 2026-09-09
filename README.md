@@ -23,7 +23,6 @@ Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 cd export
 uv venv .venv
 uv pip install --python .venv/bin/python torch transformers safetensors numpy huggingface_hub
-.venv/bin/python export.py
 ```
 
 (A recent uv can replace the two install lines with `uv sync` in `export/`.)
