@@ -24,22 +24,29 @@ next was added.
 
 ## Try it with Docker
 
-Nothing to install beyond Docker. The build downloads the model from
-HuggingFace (about 270 MB) and compiles QB64 and the engine.
+Nothing to install beyond Docker. A prebuilt image for amd64 and arm64 is
+on Docker Hub:
 
 ```bash
-docker build -t gotoken .
-docker run -it gotoken
+docker run -it bmuskalla/gotoken
 ```
 
 That starts the REPL (`-it` matters: it reads your terminal). Type a
 prompt, get a continuation, token by token. Other commands run the same way:
 
 ```bash
-docker run gotoken complete 32 "The capital of France is"
-docker run gotoken encode "Hello world"
-docker run gotoken info
-docker run -it gotoken repl 1.0 0.9 40 7     # temperature, top-p, top-k, seed
+docker run bmuskalla/gotoken complete 32 "The capital of France is"
+docker run bmuskalla/gotoken encode "Hello world"
+docker run bmuskalla/gotoken info
+docker run -it bmuskalla/gotoken repl 1.0 0.9 40 7     # temperature, top-p, top-k, seed
+```
+
+To build the image yourself instead (it downloads the model from
+HuggingFace, about 270 MB, and compiles QB64 and the engine):
+
+```bash
+docker build -t gotoken .
+docker run -it gotoken
 ```
 
 Expect about one token per second, after four seconds of loading. The
@@ -144,6 +151,21 @@ weights plus caches), a
 continues text). Special tokens typed into a prompt are treated as plain
 text. The obvious next step, int8 weights with per-row scales, is step 9
 of the plan and has not been done.
+
+## Publishing the image
+
+`publish.sh` builds the image for linux/amd64 and linux/arm64 and pushes
+it to Docker Hub, with `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a
+personal access token with read/write scope) in the environment:
+
+```bash
+DOCKERHUB_USERNAME=you DOCKERHUB_TOKEN=dckr_pat_... ./publish.sh v1.0
+```
+
+The GitHub Actions workflow in `.github/workflows/docker.yml` does the same
+on every push to `main` (as `:latest`) and on tags starting with `v`, using
+the two names above as repository secrets. The arm64 half builds under
+QEMU on the runner, so a run takes a while.
 
 ## License
 
