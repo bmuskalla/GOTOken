@@ -123,8 +123,8 @@ src/tokenizer.bi/.bm  tokenizer.json -> byte-level BPE with the GPT-2 pre-tokeni
 src/unicode.bm      codepoint ranges for \p{L}, \p{N}, \s as string tables
 src/checks.bm       printers for the verification commands
 fetch-model.sh      downloads the three checkpoint files with curl
-export/oracle.py    the Python oracle: reference values from the real model, comparisons
-export/bpe_ref.py   the tokenizer in Python against tokenizer.json, as a spec
+oracle/oracle.py    the Python oracle: reference values from the real model, comparisons
+oracle/bpe_ref.py   the tokenizer in Python against tokenizer.json, as a spec
 FORMAT.md           what the loader makes of the checkpoint, and the memory layout
 docs/STEPS.md       the build log, step by step
 ```
@@ -149,7 +149,7 @@ RoPE pair layout) are handled there; see [FORMAT.md](FORMAT.md).
 ## Verification
 
 Every stage has a Python oracle that computes the reference from the real
-model and compares, and `export/oracle.ipynb` runs all of them:
+model and compares, and `oracle/oracle.ipynb` runs all of them:
 
 | stage | checked against | result |
 |---|---|---|
@@ -163,11 +163,11 @@ model and compares, and `export/oracle.ipynb` runs all of them:
 | sampler | a numpy re-implementation, same seed | same coins, same tokens |
 
 The oracle is Python (it needs PyTorch and transformers to run the real
-model) and is not part of inference. To run it, create a venv in `export/`,
-install `export/requirements.txt`, then for example
+model) and is not part of inference. To run it, create a venv in `oracle/`,
+install `oracle/requirements.txt`, then for example
 
 ```bash
-cd export && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --basic
+cd oracle && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --basic
 ```
 
 or open the notebook.

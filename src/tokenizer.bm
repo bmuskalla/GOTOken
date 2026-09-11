@@ -1,5 +1,5 @@
 ' tokenizer.bm - byte-level BPE, the way SmolLM2's (GPT-2 style) tokenizer
-' does it, loaded straight from tokenizer.json. export/bpe_ref.py is the
+' does it, loaded straight from tokenizer.json. oracle/bpe_ref.py is the
 ' same algorithm in Python, validated against HuggingFace; keep them in sync.
 '
 ' encode(text):

@@ -1,5 +1,5 @@
 ' checks.bm - checkpoint printers. Each step's numbers, in a fixed format the
-' Python oracle (export/oracle.py) can parse and compare.
+' Python oracle (oracle/oracle.py) can parse and compare.
 
 SUB PrintModelInfo
     PRINT "config.json"

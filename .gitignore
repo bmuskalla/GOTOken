@@ -1,7 +1,7 @@
 # the model directory (fetch-model.sh)
 model/
 # python
-export/.venv/
+oracle/.venv/
 __pycache__/
 *.pyc
 # QB64 build output

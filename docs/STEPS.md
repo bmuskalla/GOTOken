@@ -3,7 +3,7 @@
 GOTOken was built one verified step at a time, following the plan below.
 Each section is the record of one step: what was built, the exact numbers
 the checkpoint produced, and the concept the step was there to teach. The
-oracle notebook (`export/oracle.ipynb`) reproduces every comparison.
+oracle notebook (`oracle/oracle.ipynb`) reproduces every comparison.
 
 ## The plan
 
@@ -25,7 +25,7 @@ oracle notebook (`export/oracle.ipynb`) reproduces every comparison.
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
 ```bash
-cd export
+cd oracle
 uv venv .venv
 uv pip install --python .venv/bin/python torch transformers safetensors numpy huggingface_hub
 ```
@@ -82,7 +82,7 @@ contiguously.
 
 ```bash
 ./build.sh && ./build/gotoken logits 2644
-cd export && .venv/bin/python oracle.py step2 --token 2644 --basic
+cd oracle && .venv/bin/python oracle.py step2 --token 2644 --basic
 ```
 
 `gotoken logits <token_id>` copies that token's embedding row into `x()` and runs the
@@ -104,7 +104,7 @@ is the topic of step 3, where the matmul gets tested in isolation.
 
 ```bash
 ./build.sh && ./build/gotoken kernels 2644
-cd export && .venv/bin/python oracle.py step3 --token 2644 --basic
+cd oracle && .venv/bin/python oracle.py step3 --token 2644 --basic
 ```
 
 `gotoken kernels <token_id>` runs each kernel once on real layer-0 weights
@@ -154,7 +154,7 @@ partial sum), and the observed errors sit a decade below the bound.
 
 ```bash
 ./build.sh && ./build/gotoken layer 504 2644 2643 335 260
-cd export && .venv/bin/python oracle.py step4 --tokens 504 2644 2643 335 260 --basic
+cd oracle && .venv/bin/python oracle.py step4 --tokens 504 2644 2643 335 260 --basic
 ```
 
 `gotoken layer <id> [<id> ...]` runs layer 0 over a token sequence, token
@@ -223,7 +223,7 @@ still just a hook on layer 0.
 ./build.sh
 ./build/gotoken forward 504 2644 2643 335 260        # logits after all 30 layers
 ./build/gotoken generate 8 504 2644 2643 335 260     # greedy, 8 new tokens
-cd export && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --steps 8 --basic
+cd oracle && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --steps 8 --basic
 ```
 
 `Forward` in `src/forward.bm` is now run.c's `forward()`: embed, 30 layers,
@@ -281,7 +281,7 @@ scores, not probabilities.
 ./build.sh
 ./build/gotoken generate 8 504 2644 2643 335 260            # with the cache
 ./build/gotoken generate-nocache 8 504 2644 2643 335 260    # step 5 behaviour
-cd export && .venv/bin/python oracle.py step6 --tokens 504 2644 2643 335 260 --steps 8 --long 24 --basic
+cd oracle && .venv/bin/python oracle.py step6 --tokens 504 2644 2643 335 260 --steps 8 --long 24 --basic
 ```
 
 The cache arrays have existed since step 4: `keyCache` and `valueCache`,
@@ -330,8 +330,8 @@ all of it in matmul against 538 MB of weights. That is step 9's problem.
 ./build/gotoken encode "Hello world, I'm naïve 🚀 12345"
 ./build/gotoken decode 19556 905 28
 ./build/gotoken complete 8 "The capital of France is"
-cd export && .venv/bin/python bpe_ref.py            # Python reference vs HuggingFace
-cd export && .venv/bin/python oracle.py step7 --basic  # BASIC vs HuggingFace
+cd oracle && .venv/bin/python bpe_ref.py            # Python reference vs HuggingFace
+cd oracle && .venv/bin/python oracle.py step7 --basic  # BASIC vs HuggingFace
 ```
 
 | check                                          | result |
@@ -345,7 +345,7 @@ decoding with the KV cache, text out. `The capital of France is` gives
 ` the capital of the country.` which is what 135M parameters know.
 
 **How it was built.** The tokenizer was written twice on purpose. First
-`export/bpe_ref.py`, in Python but reading only `tokenizer.bin`, and
+`oracle/bpe_ref.py`, in Python but reading only `tokenizer.bin`, and
 validated against HuggingFace on the corpus until every string matched.
 Then `src/tokenizer.bm`, a line-by-line port. When the port disagreed with
 HuggingFace, the reference said whether the algorithm or the port was wrong.
@@ -389,7 +389,7 @@ token, dropped silently, are the same kind of thing.
 ./build/gotoken repl                      # temperature 0.7, top-p 0.9, 64 tokens per line
 ./build/gotoken repl 1.0 0.9 40 7         # temperature, top-p, top-k, seed
 ./build/gotoken sample 8 0.8 0.9 0 42 6403 1980 253 655
-cd export && .venv/bin/python oracle.py step8 --tokens 6403 1980 253 655 --basic
+cd oracle && .venv/bin/python oracle.py step8 --tokens 6403 1980 253 655 --basic
 ```
 
 In the REPL every line is a fresh prompt; `/temp 0.3`, `/topp 0.95`,
