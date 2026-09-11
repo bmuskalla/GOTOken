@@ -81,20 +81,11 @@ makes of them.
 ./fetch-model.sh
 ```
 
-**2. Install QB64.** On Linux, `setup_lnx.sh` from the
-[release tarball](https://github.com/QB64Official/qb64/releases/tag/v2.1)
-does it; the [Dockerfile](Dockerfile) shows the exact steps without the IDE.
-On macOS the tarball ships source and builds with clang:
-
-```bash
-curl -sSL -o /tmp/qb64.tar.gz https://github.com/QB64Official/qb64/releases/download/v2.1/qb64_dev_2022-09-08-07-14-00_47f5044_osx.tar.gz
-tar xzf /tmp/qb64.tar.gz -C /tmp && mv /tmp/qb64_*_osx ~/qb64
-cd ~/qb64 && find . -name "*.command" -exec chmod +x {} \;
-(cd internal/c/libqb/os/osx && ./setup_build.command)
-(cd internal/c/parts/video/font/ttf/os/osx && ./setup_build.command)
-cp internal/source/* internal/temp/
-(cd internal/c && clang++ -w qbx.cpp libqb/os/osx/libqb_setup.o parts/video/font/ttf/os/osx/src.o -framework GLUT -framework OpenGL -framework Cocoa -o ../../qb64)
-```
+**2. Install QB64.** Download the 2.1 release for your platform from
+[qb64.com](https://qb64.com) and run the setup script that comes with it
+(`setup_osx.command` on macOS, `setup_lnx.sh` on Linux). It builds the
+compiler from the bundled source and leaves a `qb64` binary in the folder.
+The [Dockerfile](Dockerfile) shows the same steps for Linux without the IDE.
 
 **3. Build and run.** `build.sh` expects the compiler at `~/qb64/qb64`; set
 `QB64` to point elsewhere.
