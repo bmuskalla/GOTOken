@@ -41,14 +41,6 @@ docker run bmuskalla/gotoken info
 docker run -it bmuskalla/gotoken repl 1.0 0.9 40 7     # temperature, top-p, top-k, seed
 ```
 
-To build the image yourself instead (it downloads the model from
-HuggingFace, about 270 MB, and compiles QB64 and the engine):
-
-```bash
-docker build -t gotoken .
-docker run -it gotoken
-```
-
 Expect about one token per second, after four seconds of loading. The
 engine is plain unoptimized BASIC compiled with no optimization flags, doing
 134 million multiply-adds per token in a triple loop. The KV cache keeps
@@ -77,32 +69,19 @@ them all.
 
 ## Build it yourself
 
-You need QB64 2.1 and curl.
-
-**1. Fetch the model.** Three files from HuggingFace into `model/`:
-`config.json`, `model.safetensors` (270 MB, bf16) and `tokenizer.json`.
-The engine reads them as they are; see [FORMAT.md](FORMAT.md) for what it
-makes of them.
-
 ```bash
-./fetch-model.sh
+docker build -t gotoken .
+docker run -it gotoken
 ```
 
-**2. Install QB64.** Download the 2.1 release for your platform from
-[qb64.com](https://qb64.com) and run the setup script that comes with it
-(`setup_osx.command` on macOS, `setup_lnx.sh` on Linux). It builds the
-compiler from the bundled source and leaves a `qb64` binary in the folder.
-The [Dockerfile](Dockerfile) shows the same steps for Linux without the IDE.
+The build downloads the model from HuggingFace (about 270 MB, three
+files: `config.json`, `model.safetensors`, `tokenizer.json`), compiles QB64
+2.1 from its release tarball and then the engine, and leaves a slim image
+with just the binary and the model. See the [Dockerfile](Dockerfile).
 
-**3. Build and run.** `build.sh` expects the compiler at `~/qb64/qb64`; set
-`QB64` to point elsewhere.
-
-```bash
-./build.sh
-./build/gotoken repl
-```
-
-`GOTOKEN_MODEL` points the engine at a different model directory.
+Without Docker, the same two steps are `./fetch-model.sh` and `./build.sh`,
+with QB64 2.1 from [qb64.com](https://qb64.com) at `~/qb64/qb64` (or set
+`QB64`). `GOTOKEN_MODEL` points the engine at a different model directory.
 
 ## How it works
 
