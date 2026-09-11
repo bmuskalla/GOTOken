@@ -22,6 +22,34 @@ map almost one to one onto karpathy's [llama2.c](https://github.com/karpathy/lla
 and every piece was verified numerically against the real model before the
 next was added.
 
+Two halves. Loading turns the checkpoint files into one flat weight array
+and the tokenizer's tables:
+
+```mermaid
+flowchart LR
+    cfg[config.json] --> js[JSON parser]
+    st[model.safetensors] --> js
+    tj[tokenizer.json] --> js
+    js -- "shape, rope_theta, eps" --> cfgv[Config]
+    js -- "bf16 to fp32 shift,\nQ/K row permutation" --> w[("w()  all weights as fp32,\none flat array + an offset per tensor")]
+    js -- "invert byte-level alphabet,\nscore = -(merge rank)" --> vocab[("vocab bytes, merge scores,\nbyte map, Unicode classes")]
+```
+
+Generating is run.c's loop: one forward pass per token, the result fed
+back in.
+
+```mermaid
+flowchart TB
+    text[prompt text] --> enc["Encode\nGPT-2 regex + BPE merges"] --> ids[token ids] --> emb[Embed]
+    subgraph layer["TransformerLayer, repeated n_layers times, KV cache per layer"]
+        direction LR
+        n1[RMSNorm] --> attn["attention\nq k v, RoPE, GQA, softmax, wo"] --> r1((+)) --> n2[RMSNorm] --> ffn["SwiGLU FFN\nw2( silu(w1 x) * w3 x )"] --> r2((+))
+    end
+    emb --> layer --> fn[RMSNorm] --> cls["Classify\ntied embedding matmul"] --> logits[logits, one per vocab entry]
+    logits --> smp["Sample\ntemperature, top-k, top-p"] --> nxt[next token] --> dec[Decode] --> out[text]
+    nxt -.-> back["appended to the token ids;\nthe next forward pass runs at the next position"]
+```
+
 ## Try it with Docker
 
 Nothing to install beyond Docker. A prebuilt image for amd64 and arm64 is
