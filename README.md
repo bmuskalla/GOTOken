@@ -131,21 +131,6 @@ continues text). Special tokens typed into a prompt are treated as plain
 text. The obvious next step, int8 weights with per-row scales, is step 9
 of the plan and has not been done.
 
-## Publishing the image
-
-`publish.sh` builds the image for linux/amd64 and linux/arm64 and pushes
-it to Docker Hub, with `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a
-personal access token with read/write scope) in the environment:
-
-```bash
-DOCKERHUB_USERNAME=you DOCKERHUB_TOKEN=dckr_pat_... ./publish.sh v1.0
-```
-
-The GitHub Actions workflow in `.github/workflows/docker.yml` does the same
-on every push to `main` (as `:latest`) and on tags starting with `v`, using
-the two names above as repository secrets. The arm64 half builds under
-QEMU on the runner, so a run takes a while.
-
 ## License
 
 Apache 2.0, see [LICENSE](LICENSE). The model, SmolLM2-135M from HuggingFace,
