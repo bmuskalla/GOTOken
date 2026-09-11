@@ -17,11 +17,10 @@ flowers. One day, Oscar had an idea - why not start a nonprofit organization?
 [ 64 tokens, 67 forwards, 65.6 s ]
 ```
 
-It is a learning project: the whole engine is about 1200 lines of BASIC that
+It is a learning project: the whole engine is about 1500 lines of BASIC that
 map almost one to one onto karpathy's [llama2.c](https://github.com/karpathy/llama2.c),
 and every piece was verified numerically against the real model before the
-next was added. That record, with all the numbers and the concept behind each
-step, is in [docs/STEPS.md](docs/STEPS.md).
+next was added.
 
 ## Try it with Docker
 
@@ -126,7 +125,6 @@ fetch-model.sh      downloads the three checkpoint files with curl
 oracle/oracle.py    the Python oracle: reference values from the real model, comparisons
 oracle/bpe_ref.py   the tokenizer in Python against tokenizer.json, as a spec
 FORMAT.md           what the loader makes of the checkpoint, and the memory layout
-docs/STEPS.md       the build log, step by step
 ```
 
 QB64 has no modules, only textual `$INCLUDE`: declarations (`.bi`) go before
