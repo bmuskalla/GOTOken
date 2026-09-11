@@ -146,32 +146,6 @@ inverts GPT-2's byte-level alphabet to get raw token bytes. Details that
 llama2.c hardcodes and this model needs differently (rope_theta 100000, the
 RoPE pair layout) are handled there; see [FORMAT.md](FORMAT.md).
 
-## Verification
-
-Every stage has a Python oracle that computes the reference from the real
-model and compares, and `oracle/oracle.ipynb` runs all of them:
-
-| stage | checked against | result |
-|---|---|---|
-| checkpoint loading | a Python export of the same checkpoint, element by element | 134.5M weights, 49152 tokens, all identical |
-| embedding + tied head | float64 dot products | within 4e-6 |
-| MatMul, RMSNorm | float64; the fp32 loop replayed | within 1e-5; bit-exact replay |
-| one transformer layer | a forward hook on layer 0 | within 1.5e-5 |
-| full forward + greedy | `model.generate(do_sample=False)` | token for token, 24/24 |
-| KV cache | the uncached engine | bit-identical logits, 5.7x faster over 8 tokens |
-| tokenizer | HuggingFace on 2060 strings | 2060/2060 |
-| sampler | a numpy re-implementation, same seed | same coins, same tokens |
-
-The oracle is Python (it needs PyTorch and transformers to run the real
-model) and is not part of inference. To run it, create a venv in `oracle/`,
-install `oracle/requirements.txt`, then for example
-
-```bash
-cd oracle && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --basic
-```
-
-or open the notebook.
-
 ## Limits
 
 One token per second, four seconds to load, 1.1 GB of memory (fp32
