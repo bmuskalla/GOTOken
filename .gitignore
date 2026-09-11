@@ -1,5 +1,5 @@
-# exported binaries (regenerate with export/export.py)
-*.bin
+# the model directory (fetch-model.sh)
+model/
 # python
 export/.venv/
 __pycache__/

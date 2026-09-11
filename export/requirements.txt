@@ -1,3 +1,8 @@
+# the Python oracle: verifies the engine against the real model (not needed to run it)
 numpy>=1.26
-huggingface_hub>=0.24
-tokenizers>=0.19
+torch>=2.2
+transformers>=4.44
+notebook
+nbconvert
+ipykernel
+nbformat

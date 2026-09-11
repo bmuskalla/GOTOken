@@ -28,11 +28,20 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from export import permute_for_interleaved_rope
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 REPO = Path(__file__).resolve().parent.parent
 BASIC_EXE = REPO / "build" / "gotoken"
+
+
+def permute_for_interleaved_rope(w: np.ndarray, n_heads: int) -> np.ndarray:
+    """What the engine's loader does to the rows of a Q or K projection: per
+    head, HuggingFace's rotary pair (j, j + head_dim/2) becomes the adjacent
+    pair (2j, 2j+1) that run.c's RoPE expects. Same as llama2.c's
+    permute_reverse. Attention scores are invariant under it."""
+    out_dim, in_dim = w.shape
+    head_dim = out_dim // n_heads
+    return w.reshape(n_heads, 2, head_dim // 2, in_dim).transpose(0, 2, 1, 3).reshape(out_dim, in_dim)
 
 
 def load_model():

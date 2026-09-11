@@ -14,7 +14,8 @@
 '         gotoken complete <max_tokens> "<text>"  step 7: complete a text prompt (greedy, stops at end of text)
 '         gotoken sample <steps> <temp> <topp> <topk> <seed> <id> [...]  step 8: sampled decode
 '         gotoken repl [temp] [topp] [topk] [seed]   step 8: interactive; /temp /topp /topk /seed /steps /quit
-' Set GOTOKEN_WEIGHTS / GOTOKEN_TOKENIZER to use files other than ./model/*.bin.
+' The model directory (config.json, model.safetensors, tokenizer.json, the
+' HuggingFace layout) is ./model relative to the launch directory, or GOTOKEN_MODEL.
 '
 ' Layout: QB64 has no modules, only textual includes. Declarations (.bi) go
 ' at the top, subs and functions (.bm) must follow all main-program code, so
@@ -24,40 +25,40 @@
 
 $CONSOLE:ONLY
 OPTION _EXPLICIT
+ON ERROR GOTO runtimeError ' print instead of a dialog box; the handler is at the end of the main program
 
+'$INCLUDE: 'src/json.bi'
 '$INCLUDE: 'src/model.bi'
 '$INCLUDE: 'src/state.bi'
 '$INCLUDE: 'src/tokenizer.bi'
 '$INCLUDE: 'src/sampler.bi'
 
-DIM path AS STRING, tokPath AS STRING, cmd AS STRING, token AS LONG, t0 AS DOUBLE, n AS LONG, i AS LONG
+DIM modelDir AS STRING, cmd AS STRING, token AS LONG, t0 AS DOUBLE, n AS LONG, i AS LONG
 DIM text AS STRING, f AS LONG, count AS LONG, k AS LONG, steps AS LONG, userLine AS STRING, arg AS STRING
 REDIM tokens(0 TO 0) AS LONG
 
-' Like run.c: the checkpoint path comes from outside. QB64 chdirs into the
-' executable's folder at startup, so the default is resolved from the
+' Like run.c: the checkpoint location comes from outside. QB64 chdirs into
+' the executable's folder at startup, so the default is resolved from the
 ' directory the program was launched from.
-path = ENVIRON$("GOTOKEN_WEIGHTS")
-IF path = "" THEN path = _STARTDIR$ + "/model/weights.bin"
-tokPath = ENVIRON$("GOTOKEN_TOKENIZER")
-IF tokPath = "" THEN tokPath = _STARTDIR$ + "/model/tokenizer.bin"
+modelDir = ENVIRON$("GOTOKEN_MODEL")
+IF modelDir = "" THEN modelDir = _STARTDIR$ + "/model"
 cmd = COMMAND$(1)
 
-' the tokenizer-only commands do not need 538 MB of weights
+' the tokenizer-only commands do not need the 538 MB of weights
 IF cmd = "encode" OR cmd = "decode" OR cmd = "encode-batch" OR cmd = "complete" OR cmd = "repl" THEN
     t0 = TIMER(0.001)
-    LoadTokenizer tokPath
+    LoadTokenizer modelDir
     PRINT "loaded"; tokVocabSize; "tokens in"; TIMER(0.001) - t0; "s"
 END IF
 IF cmd <> "encode" AND cmd <> "decode" AND cmd <> "encode-batch" THEN
     t0 = TIMER(0.001)
-    LoadModel path
+    LoadModel modelDir
     AllocRunState
     InitSampler 0, 1, 0, 42 ' greedy unless a command says otherwise
     PRINT "loaded"; nParams; "floats in"; TIMER(0.001) - t0; "s"
 END IF
 
-token = VAL(COMMAND$(2))
+token = VAL(COMMAND$(2)) ' for the single-token commands
 SELECT CASE cmd
     CASE "", "info"
         PrintModelInfo
@@ -191,11 +192,17 @@ SELECT CASE cmd
 END SELECT
 SYSTEM
 
+runtimeError:
+PRINT "runtime error"; ERR; "in "; _INCLERRORFILE$; " line"; _INCLERRORLINE; " (main line"; _ERRORLINE; ")"
+SYSTEM
+
 '$INCLUDE: 'src/util.bm'
+'$INCLUDE: 'src/json.bm'
 '$INCLUDE: 'src/model.bm'
 '$INCLUDE: 'src/kernels.bm'
 '$INCLUDE: 'src/forward.bm'
 '$INCLUDE: 'src/tokenizer.bm'
+'$INCLUDE: 'src/unicode.bm'
 '$INCLUDE: 'src/sampler.bm'
 '$INCLUDE: 'src/generate.bm'
 '$INCLUDE: 'src/checks.bm'

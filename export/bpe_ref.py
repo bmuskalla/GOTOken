@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Reference tokenizer that uses nothing but tokenizer.bin.
+Reference tokenizer that uses nothing but tokenizer.json and Python's
+Unicode database.
 
 This is the algorithm src/tokenizer.bm implements, written first in Python so
-it can be validated against HuggingFace on thousands of strings before being
-ported to BASIC. Anything HuggingFace does that this file does not is either
-handled at export time or listed under "Known differences" below.
+it could be validated against HuggingFace on thousands of strings before
+being ported to BASIC. Anything HuggingFace does that this file does not is
+listed under "Known differences" below.
 
 The pipeline for encode(text):
 
@@ -26,14 +27,48 @@ Usage:
     python bpe_ref.py            # validate against HuggingFace on the test corpus
 """
 
+import json
 import random
-import struct
 import sys
+import unicodedata
 from bisect import bisect_right
 from pathlib import Path
 
-TOKENIZER_BIN = Path(__file__).resolve().parent.parent / "model" / "tokenizer.bin"
+TOKENIZER_JSON = Path(__file__).resolve().parent.parent / "model" / "tokenizer.json"
 CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
+NO_MERGE_SCORE = -1e30
+
+
+def bytes_to_unicode() -> dict[int, str]:
+    """GPT-2's reversible byte -> printable-unicode map, in which tokenizer.json
+    writes its vocab (a space shows up as 'Ġ')."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, (chr(c) for c in cs)))
+
+
+def unicode_ranges(pred) -> list[tuple[int, int]]:
+    out, start = [], None
+    for cp in range(0x110000):
+        if pred(cp):
+            if start is None:
+                start = cp
+        elif start is not None:
+            out.append((start, cp - 1))
+            start = None
+    if start is not None:
+        out.append((start, 0x10FFFF))
+    return out
+
+
+WHITE_SPACE = set(range(0x09, 0x0E)) | {0x20, 0x85, 0xA0, 0x1680} | set(range(0x2000, 0x200B)) | \
+    {0x2028, 0x2029, 0x202F, 0x205F, 0x3000}
 
 
 class Ranges:
@@ -49,23 +84,30 @@ class Ranges:
 
 
 class Tokenizer:
-    def __init__(self, path=TOKENIZER_BIN):
-        with open(path, "rb") as f:
-            self.vocab_size, self.max_token_length = struct.unpack("<ii", f.read(8))
-            self.tokens: list[bytes] = []
-            self.scores: list[float] = []
-            for _ in range(self.vocab_size):
-                score, n = struct.unpack("<fi", f.read(8))
-                self.tokens.append(f.read(n))
-                self.scores.append(score)
-            classes = {}
-            for name in ("L", "N", "WS"):
-                (n,) = struct.unpack("<i", f.read(4))
-                classes[name] = Ranges([struct.unpack("<ii", f.read(8)) for _ in range(n)])
-            assert not f.read(1), "trailing bytes in tokenizer.bin"
-        self.letters, self.numbers, self.spaces = classes["L"], classes["N"], classes["WS"]
+    def __init__(self, path=TOKENIZER_JSON):
+        tj = json.loads(Path(path).read_text())
+        assert tj["model"]["type"] == "BPE"
+        vocab: dict[str, int] = tj["model"]["vocab"]
+        self.vocab_size = len(vocab)
+        u2b = {ch: b for b, ch in bytes_to_unicode().items()}
+        self.tokens: list[bytes] = [b""] * self.vocab_size
+        for s, i in vocab.items():
+            self.tokens[i] = bytes(u2b[ch] for ch in s)
+        for a in tj["added_tokens"]:  # specials are literal text, not byte-level encoded
+            self.tokens[a["id"]] = a["content"].encode("utf-8")
         self.id_of: dict[bytes, int] = {t: i for i, t in enumerate(self.tokens)}
+        # score = -rank of the merge that produces a token; the first rule wins
+        self.scores: list[float] = [NO_MERGE_SCORE] * self.vocab_size
+        for r, m in enumerate(tj["model"]["merges"]):
+            a, b = m.split(" ") if isinstance(m, str) else m
+            i = self.id_of[bytes(u2b[ch] for ch in a + b)]
+            if self.scores[i] == NO_MERGE_SCORE:
+                self.scores[i] = -r
+        self.max_token_length = max(len(t) for t in self.tokens)
         self.byte_id: list[int | None] = [self.id_of.get(bytes([b])) for b in range(256)]
+        self.letters = Ranges(unicode_ranges(lambda cp: unicodedata.category(chr(cp)).startswith("L")))
+        self.numbers = Ranges(unicode_ranges(lambda cp: unicodedata.category(chr(cp)).startswith("N")))
+        self.spaces = Ranges(unicode_ranges(lambda cp: cp in WHITE_SPACE))
 
     # -- 1. pre-tokenizer -------------------------------------------------- #
     def _cls(self, ch: str) -> str:

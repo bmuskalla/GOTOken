@@ -3,7 +3,9 @@
 A language model inference engine written in BASIC. It runs
 [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), a
 Llama-architecture model, in [QB64](https://qb64.com), and produces the same
-tokens as HuggingFace `transformers` does.
+tokens as HuggingFace `transformers` does. It reads the HuggingFace
+checkpoint files directly: from `config.json`, `model.safetensors` and
+`tokenizer.json` to generated text, everything is BASIC.
 
 ```
 $ docker run -it gotoken
@@ -24,7 +26,7 @@ step, is in [docs/STEPS.md](docs/STEPS.md).
 ## Try it with Docker
 
 Nothing to install beyond Docker. The build downloads the model from
-HuggingFace (about 270 MB), converts it, and compiles QB64 and the engine.
+HuggingFace (about 270 MB) and compiles QB64 and the engine.
 
 ```bash
 docker build -t gotoken .
@@ -41,9 +43,10 @@ docker run gotoken info
 docker run -it gotoken repl 1.0 0.9 40 7     # temperature, top-p, top-k, seed
 ```
 
-Expect about one token per second. The engine is plain unoptimized BASIC
-compiled with no optimization flags, doing 134 million multiply-adds per
-token in a triple loop. The KV cache keeps that constant as the text grows.
+Expect about one token per second, after four seconds of loading. The
+engine is plain unoptimized BASIC compiled with no optimization flags, doing
+134 million multiply-adds per token in a triple loop. The KV cache keeps
+that constant as the text grows.
 
 ## Usage
 
@@ -68,17 +71,15 @@ them all.
 
 ## Build it yourself
 
-You need Python 3.11+ for the export and QB64 2.1 for the engine.
+You need QB64 2.1 and curl.
 
-**1. Export the model.** Reads the HuggingFace checkpoint and writes two
-flat binaries (`model/weights.bin`, 538 MB of fp32, and
-`model/tokenizer.bin`) whose layout is documented in [FORMAT.md](FORMAT.md).
-No PyTorch needed.
+**1. Fetch the model.** Three files from HuggingFace into `model/`:
+`config.json`, `model.safetensors` (270 MB, bf16) and `tokenizer.json`.
+The engine reads them as they are; see [FORMAT.md](FORMAT.md) for what it
+makes of them.
 
 ```bash
-cd export
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python export.py
+./fetch-model.sh
 ```
 
 **2. Install QB64.** On Linux, `setup_lnx.sh` from the
@@ -104,25 +105,27 @@ cp internal/source/* internal/temp/
 ./build/gotoken repl
 ```
 
-`GOTOKEN_WEIGHTS` and `GOTOKEN_TOKENIZER` override the model file paths.
+`GOTOKEN_MODEL` points the engine at a different model directory.
 
 ## How it works
 
 ```
 gotoken.bas         main program and command dispatch
-src/model.bi/.bm    the 48-byte header, one flat SINGLE array holding all
-                    134.5M weights, and an offset per tensor (run.c's
-                    memory_map_weights without pointers)
+src/json.bi/.bm     a small JSON parser for the three checkpoint files
+src/model.bi/.bm    config.json and model.safetensors -> one flat SINGLE
+                    array holding all 134.5M weights, an offset per tensor
+                    (run.c's memory_map_weights without pointers)
 src/kernels.bm      MatMul, RmsNorm, Softmax
 src/forward.bm      Embed, Rope, TransformerLayer, Forward, Classify
 src/generate.bm     the autoregressive loop, with the KV cache
 src/sampler.bi/.bm  temperature, top-k, top-p, seeded xorshift64*
-src/tokenizer.bi/.bm  byte-level BPE with the GPT-2 pre-tokenizer regex
+src/tokenizer.bi/.bm  tokenizer.json -> byte-level BPE with the GPT-2 pre-tokenizer regex
+src/unicode.bm      codepoint ranges for \p{L}, \p{N}, \s as string tables
 src/checks.bm       printers for the verification commands
-export/export.py    HuggingFace checkpoint -> weights.bin + tokenizer.bin
-export/oracle.py    reference values from the real model, and comparisons
-export/bpe_ref.py   the tokenizer in Python against tokenizer.bin, as a spec
-FORMAT.md           byte layout of the two binaries
+fetch-model.sh      downloads the three checkpoint files with curl
+export/oracle.py    the Python oracle: reference values from the real model, comparisons
+export/bpe_ref.py   the tokenizer in Python against tokenizer.json, as a spec
+FORMAT.md           what the loader makes of the checkpoint, and the memory layout
 docs/STEPS.md       the build log, step by step
 ```
 
@@ -134,13 +137,14 @@ run 30 layers of pre-norm attention (9 query heads sharing 3 key/value
 heads, rotary positions) and SwiGLU feed-forward on the residual stream,
 normalize, and multiply by the tied embedding table to get 49152 logits.
 The sampler turns those into one token; the tokenizer turns tokens into
-bytes. All arithmetic is fp32 (BASIC `SINGLE`), and the weights are loaded
-byte-exact from the export.
+bytes. All arithmetic is fp32 (BASIC `SINGLE`).
 
-Model details that llama2.c hardcodes and this model needs differently
-(rope_theta 100000, the RoPE pair layout, no digit merges in the
-tokenizer) are absorbed at export time so the BASIC stays simple; see
-[FORMAT.md](FORMAT.md).
+Loading is the engine's own work too: it parses the safetensors header and
+tokenizer.json with a 250-line JSON parser, converts bf16 weights to fp32
+with a 16-bit shift, reorders the Q and K rows for run.c's RoPE layout, and
+inverts GPT-2's byte-level alphabet to get raw token bytes. Details that
+llama2.c hardcodes and this model needs differently (rope_theta 100000, the
+RoPE pair layout) are handled there; see [FORMAT.md](FORMAT.md).
 
 ## Verification
 
@@ -149,7 +153,7 @@ model and compares, and `export/oracle.ipynb` runs all of them:
 
 | stage | checked against | result |
 |---|---|---|
-| weight loading | the export, byte for byte | exact |
+| checkpoint loading | a Python export of the same checkpoint, element by element | 134.5M weights, 49152 tokens, all identical |
 | embedding + tied head | float64 dot products | within 4e-6 |
 | MatMul, RMSNorm | float64; the fp32 loop replayed | within 1e-5; bit-exact replay |
 | one transformer layer | a forward hook on layer 0 | within 1.5e-5 |
@@ -158,8 +162,9 @@ model and compares, and `export/oracle.ipynb` runs all of them:
 | tokenizer | HuggingFace on 2060 strings | 2060/2060 |
 | sampler | a numpy re-implementation, same seed | same coins, same tokens |
 
-To run the oracle yourself, install `export/requirements-dev.txt` into the
-venv (that one does need PyTorch), then for example
+The oracle is Python (it needs PyTorch and transformers to run the real
+model) and is not part of inference. To run it, create a venv in `export/`,
+install `export/requirements.txt`, then for example
 
 ```bash
 cd export && .venv/bin/python oracle.py step5 --tokens 504 2644 2643 335 260 --basic
@@ -169,7 +174,8 @@ or open the notebook.
 
 ## Limits
 
-One token per second, 1.1 GB of memory (fp32 weights plus caches), a
+One token per second, four seconds to load, 1.1 GB of memory (fp32
+weights plus caches), a
 1024-token context (the model allows 8192; one constant in
 `src/forward.bm`), no batching, no chat template (it is a base model, it
 continues text). Special tokens typed into a prompt are treated as plain

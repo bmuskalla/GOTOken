@@ -1,6 +1,6 @@
 ' tokenizer.bm - byte-level BPE, the way SmolLM2's (GPT-2 style) tokenizer
-' does it, using nothing but tokenizer.bin. export/bpe_ref.py is the same
-' algorithm in Python, validated against HuggingFace; keep the two in sync.
+' does it, loaded straight from tokenizer.json. export/bpe_ref.py is the
+' same algorithm in Python, validated against HuggingFace; keep them in sync.
 '
 ' encode(text):
 '   1. PreTokenize: split into chunks with the GPT-2 regex
@@ -11,39 +11,50 @@
 '      (llama2.c's loop; score = -merge_rank, so lowest rank merges first).
 '   3. bytes with no token (21 of them) are dropped, as HuggingFace does.
 
-SUB LoadTokenizer (path AS STRING)
-    DIM f AS LONG, i AS LONG, n AS LONG, s AS STRING
-    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
-    f = FREEFILE
-    OPEN path FOR BINARY AS #f
-    GET #f, , tokVocabSize
-    GET #f, , tokMaxLen
+' ---------------------------------------------------------------------------
+' LoadTokenizer: tokenizer.json -> tokStr(), tokScore(), byteId(), the hash
+' table and the Unicode class ranges.
+'
+' The vocab in tokenizer.json is byte-level: every token is a string over
+' GPT-2's 256-character alphabet, where each character stands for one byte
+' (printable Latin-1 characters stand for themselves, the 68 others are
+' mapped to U+0100 and up; a space is 'Ġ'). ByteLevelDecode$ turns such a
+' string back into the raw bytes the engine works with.
+'
+' Scores emulate GPT-2's merge ranks for llama2.c's "merge the best-scoring
+' adjacent pair" loop: the token produced by merge rule number r gets
+' score -r, so the lowest rank wins as the highest score. Tokens no merge
+' produces (byte tokens, specials) get -1e30 and are never merged into.
+' ---------------------------------------------------------------------------
+SUB LoadTokenizer (dir AS STRING)
+    DIM root AS LONG, model AS LONG, vocab AS LONG, c AS LONG, id AS LONG, rank AS LONG
+    DIM i AS LONG, m AS STRING, sp AS LONG, merged AS STRING
+    root = JsonParse&(ReadFile$(dir + "/tokenizer.json"))
+    model = JsonNeed&(root, "model")
+    IF jValue(JsonNeed&(model, "type")) <> "BPE" THEN Fail "tokenizer model is not BPE"
+    vocab = JsonNeed&(model, "vocab")
+    tokVocabSize = jLen(vocab)
     REDIM tokStr(0 TO tokVocabSize - 1) AS STRING
     REDIM tokScore(0 TO tokVocabSize - 1) AS SINGLE
     FOR i = 0 TO tokVocabSize - 1
-        GET #f, , tokScore(i)
-        GET #f, , n
-        s = SPACE$(n) ' GET into a string reads LEN(s) bytes
-        IF n > 0 THEN GET #f, , s
-        tokStr(i) = s
+        tokScore(i) = -1E+30
     NEXT
-    GET #f, , nLetterRanges
-    REDIM letterLo(0 TO nLetterRanges - 1) AS LONG, letterHi(0 TO nLetterRanges - 1) AS LONG
-    FOR i = 0 TO nLetterRanges - 1
-        GET #f, , letterLo(i): GET #f, , letterHi(i)
-    NEXT
-    GET #f, , nNumberRanges
-    REDIM numberLo(0 TO nNumberRanges - 1) AS LONG, numberHi(0 TO nNumberRanges - 1) AS LONG
-    FOR i = 0 TO nNumberRanges - 1
-        GET #f, , numberLo(i): GET #f, , numberHi(i)
-    NEXT
-    GET #f, , nSpaceRanges
-    REDIM spaceLo(0 TO nSpaceRanges - 1) AS LONG, spaceHi(0 TO nSpaceRanges - 1) AS LONG
-    FOR i = 0 TO nSpaceRanges - 1
-        GET #f, , spaceLo(i): GET #f, , spaceHi(i)
-    NEXT
-    IF LOC(f) <> LOF(f) THEN Fail "tokenizer.bin: " + STR$(LOF(f) - LOC(f)) + " trailing bytes"
-    CLOSE #f
+    BuildByteLevelMap
+
+    c = JsonFirst&(vocab)
+    WHILE c >= 0
+        id = JsonNum#(c)
+        IF id < 0 OR id >= tokVocabSize THEN Fail "vocab id out of range:" + STR$(id)
+        tokStr(id) = ByteLevelDecode$(jKey(c))
+        c = JsonNext&(c)
+    WEND
+    ' added tokens (the specials) are literal text, not byte-level encoded
+    c = JsonFirst&(JsonNeed&(root, "added_tokens"))
+    WHILE c >= 0
+        id = JsonNum#(JsonNeed&(c, "id"))
+        tokStr(id) = jValue(JsonNeed&(c, "content"))
+        c = JsonNext&(c)
+    WEND
 
     ' lookup tables: byte -> id, and string -> id
     FOR i = 0 TO 255
@@ -52,11 +63,90 @@ SUB LoadTokenizer (path AS STRING)
     FOR i = 0 TO HASH_MASK
         hashId(i) = -1
     NEXT
+    tokMaxLen = 0
     FOR i = 0 TO tokVocabSize - 1
         IF LEN(tokStr(i)) = 1 THEN byteId(ASC(tokStr(i))) = i
+        IF LEN(tokStr(i)) > tokMaxLen THEN tokMaxLen = LEN(tokStr(i))
         HashInsert tokStr(i), i
     NEXT
+
+    ' merge rules, in rank order: "a b" strings (older files) or [a, b] pairs
+    rank = 0
+    c = JsonFirst&(JsonNeed&(model, "merges"))
+    WHILE c >= 0
+        IF jType(c) = JSON_ARRAY THEN
+            merged = ByteLevelDecode$(jValue(JsonAt&(c, 0))) + ByteLevelDecode$(jValue(JsonAt&(c, 1)))
+        ELSE
+            m = jValue(c)
+            sp = INSTR(m, " ")
+            merged = ByteLevelDecode$(LEFT$(m, sp - 1)) + ByteLevelDecode$(MID$(m, sp + 1))
+        END IF
+        id = LookupId&(merged)
+        IF id < 0 THEN Fail "merge result not in vocab: " + merged
+        IF tokScore(id) = -1E+30 THEN tokScore(id) = -rank ' first rule producing a token wins
+        rank = rank + 1
+        c = JsonNext&(c)
+    WEND
+
+    LoadUnicodeRanges
 END SUB
+
+' GPT-2's byte -> unicode map, inverted: cpToByte(codepoint) = byte, or -1.
+' Bytes 33..126, 161..172 and 174..255 map to themselves; the other 68 bytes
+' map, in increasing order, to codepoints 256, 257, ...
+SUB BuildByteLevelMap
+    DIM b AS LONG, n AS LONG
+    FOR b = 0 TO 323
+        cpToByte(b) = -1
+    NEXT
+    n = 0
+    FOR b = 0 TO 255
+        IF (b >= 33 AND b <= 126) OR (b >= 161 AND b <= 172) OR (b >= 174 AND b <= 255) THEN
+            cpToByte(b) = b
+        ELSE
+            cpToByte(256 + n) = b
+            n = n + 1
+        END IF
+    NEXT
+END SUB
+
+' a vocab string (UTF-8 over the byte-level alphabet) -> the bytes it stands for
+FUNCTION ByteLevelDecode$ (s AS STRING)
+    DIM i AS LONG, cp AS LONG, decoded AS STRING
+    decoded = ""
+    i = 1
+    WHILE i <= LEN(s)
+        i = i + Utf8Next&(s, i, cp)
+        IF cp > 323 THEN Fail "not a byte-level vocab string: " + s
+        IF cpToByte(cp) < 0 THEN Fail "not a byte-level vocab string: " + s
+        decoded = decoded + CHR$(cpToByte(cp))
+    WEND
+    ByteLevelDecode$ = decoded
+END FUNCTION
+
+' the \p{L}, \p{N}, \s tables from unicode.bm: "lo,hi,lo,hi,...," strings
+SUB LoadUnicodeRanges
+    nLetterRanges = ParseRanges&(UnicodeLetters$, letterLo(), letterHi())
+    nNumberRanges = ParseRanges&(UnicodeNumbers$, numberLo(), numberHi())
+    nSpaceRanges = ParseRanges&(UnicodeSpaces$, spaceLo(), spaceHi())
+END SUB
+
+' "65,90,97,122," -> lo() = 65, 97  hi() = 90, 122; returns the count
+FUNCTION ParseRanges& (s AS STRING, lo() AS LONG, hi() AS LONG)
+    DIM n AS LONG, i AS LONG, p AS LONG, q AS LONG
+    n = 0
+    FOR i = 1 TO LEN(s)
+        IF ASC(s, i) = 44 THEN n = n + 1
+    NEXT
+    n = n \ 2
+    REDIM lo(0 TO n - 1) AS LONG, hi(0 TO n - 1) AS LONG
+    p = 1
+    FOR i = 0 TO n - 1
+        q = INSTR(p, s, ","): lo(i) = VAL(MID$(s, p, q - p)): p = q + 1
+        q = INSTR(p, s, ","): hi(i) = VAL(MID$(s, p, q - p)): p = q + 1
+    NEXT
+    ParseRanges& = n
+END FUNCTION
 
 ' ---------------------------------------------------------------------------
 ' string -> id hash table (FNV-1a, linear probing)

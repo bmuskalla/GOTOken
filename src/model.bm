@@ -1,43 +1,67 @@
-' model.bm - loading weights.bin. Included at the bottom of gotoken.bas.
+' model.bm - loading the HuggingFace checkpoint. Included at the bottom of
+' gotoken.bas. Reads config.json for the shape and model.safetensors for the
+' weights; no intermediate format.
 
 ' ---------------------------------------------------------------------------
-' LoadModel: read the header, size the array, slurp every float.
-' Equivalent to run.c read_checkpoint + memory_map_weights.
+' LoadModel: config.json -> cfg, then every tensor into its slot in w().
+' Equivalent to run.c read_checkpoint + memory_map_weights, with the file
+' format work that llama2.c's export.py does moved in here.
 ' ---------------------------------------------------------------------------
-SUB LoadModel (path AS STRING)
-    DIM f AS LONG, fileBytes AS _INTEGER64
-    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
-    f = FREEFILE
-    OPEN path FOR BINARY AS #f
-    fileBytes = LOF(f)
-    IF fileBytes < HEADER_BYTES THEN Fail "file too small: " + path
+SUB LoadModel (dir AS STRING)
+    DIM root AS LONG, l AS LONG, d AS LONG, hd AS LONG, p AS STRING
 
-    GET #f, , cfg ' the whole 48-byte record in one read
-    IF cfg.magic <> MAGIC THEN Fail "bad magic " + STR$(cfg.magic) + " (not a GOTOken weights file, or wrong endianness)"
-    IF cfg.version <> VERSION THEN Fail "unsupported version " + STR$(cfg.version)
+    ' --- the shape, from config.json --------------------------------------
+    root = JsonParse&(ReadFile$(dir + "/config.json"))
+    IF jValue(JsonNeed&(root, "model_type")) <> "llama" THEN Fail "not a llama-architecture model: " + jValue(JsonNeed&(root, "model_type"))
+    IF jValue(JsonNeed&(root, "hidden_act")) <> "silu" THEN Fail "unsupported activation " + jValue(JsonNeed&(root, "hidden_act"))
+    IF JsonGet&(root, "rope_scaling") >= 0 THEN
+        IF jType(JsonGet&(root, "rope_scaling")) <> JSON_NULL THEN Fail "rope scaling not supported"
+    END IF
+    IF JsonGet&(root, "attention_bias") >= 0 THEN
+        IF JsonNum#(JsonGet&(root, "attention_bias")) <> 0 THEN Fail "attention bias not supported"
+    END IF
+    cfg.modelDim = JsonNum#(JsonNeed&(root, "hidden_size"))
+    cfg.hiddenDim = JsonNum#(JsonNeed&(root, "intermediate_size"))
+    cfg.nLayers = JsonNum#(JsonNeed&(root, "num_hidden_layers"))
+    cfg.nHeads = JsonNum#(JsonNeed&(root, "num_attention_heads"))
+    cfg.nKvHeads = JsonNum#(JsonNeed&(root, "num_key_value_heads"))
+    cfg.vocabSize = JsonNum#(JsonNeed&(root, "vocab_size"))
+    cfg.seqLen = JsonNum#(JsonNeed&(root, "max_position_embeddings"))
+    cfg.tied = JsonNum#(JsonNeed&(root, "tie_word_embeddings"))
+    cfg.ropeTheta = JsonNum#(JsonNeed&(root, "rope_theta"))
+    cfg.rmsNormEps = JsonNum#(JsonNeed&(root, "rms_norm_eps"))
 
     headDim = cfg.modelDim \ cfg.nHeads
     kvDim = cfg.nKvHeads * headDim
     kvMul = cfg.nHeads \ cfg.nKvHeads
-
     MapWeights
-    IF fileBytes <> HEADER_BYTES + 4 * CDBL(nParams) THEN
-        Fail "size mismatch: header implies " + STR$(HEADER_BYTES + 4 * CDBL(nParams)) + " bytes, file has " + STR$(fileBytes)
-    END IF
-
-    ' One GET on an array reads the whole array: nParams * 4 bytes straight
-    ' from the file into memory. SINGLE is IEEE 754 fp32 and the file is
-    ' little-endian fp32, so on any little-endian CPU this is byte-exact.
     REDIM w(0 TO nParams - 1) AS SINGLE
-    GET #f, HEADER_BYTES + 1, w()
-    IF LOC(f) <> fileBytes THEN Fail "short read: " + STR$(LOC(f)) + " of " + STR$(fileBytes)
-    CLOSE #f
+
+    ' --- the weights, from model.safetensors ------------------------------
+    OpenSafetensors dir + "/model.safetensors"
+    d = cfg.modelDim: hd = cfg.hiddenDim
+    LoadTensor "model.embed_tokens.weight", offTokenEmbedding, cfg.vocabSize * d, 0
+    FOR l = 0 TO cfg.nLayers - 1
+        p = "model.layers." + LTRIM$(STR$(l)) + "."
+        LoadTensor p + "input_layernorm.weight", offRmsAtt(l), d, 0
+        LoadTensor p + "self_attn.q_proj.weight", offWq(l), d * d, cfg.nHeads '    rows permuted, see LoadTensor
+        LoadTensor p + "self_attn.k_proj.weight", offWk(l), kvDim * d, cfg.nKvHeads
+        LoadTensor p + "self_attn.v_proj.weight", offWv(l), kvDim * d, 0
+        LoadTensor p + "self_attn.o_proj.weight", offWo(l), d * d, 0
+        LoadTensor p + "post_attention_layernorm.weight", offRmsFfn(l), d, 0
+        LoadTensor p + "mlp.gate_proj.weight", offW1(l), hd * d, 0
+        LoadTensor p + "mlp.down_proj.weight", offW2(l), d * hd, 0
+        LoadTensor p + "mlp.up_proj.weight", offW3(l), hd * d, 0
+    NEXT
+    LoadTensor "model.norm.weight", offRmsFinal, d, 0
+    IF cfg.tied = 0 THEN LoadTensor "lm_head.weight", offWcls, cfg.vocabSize * d, 0
+    CLOSE #stFile
 END SUB
 
 ' ---------------------------------------------------------------------------
-' MapWeights: walk the blob order from FORMAT.md, assigning each tensor its
-' start offset. This is memory_map_weights from run.c with pointer bumps
-' replaced by integer bumps. Blobs are interleaved per layer.
+' MapWeights: assign each tensor its start offset in w(), in the order of
+' FORMAT.md. This is memory_map_weights from run.c with pointer bumps
+' replaced by integer bumps. Tensors are interleaved per layer.
 ' ---------------------------------------------------------------------------
 SUB MapWeights
     DIM p AS LONG, l AS LONG
@@ -70,4 +94,87 @@ SUB MapWeights
         offWcls = p: p = p + cfg.vocabSize * d
     END IF
     nParams = p
+END SUB
+
+' ---------------------------------------------------------------------------
+' safetensors: an 8-byte little-endian header length, a JSON header mapping
+' tensor name -> {dtype, shape, data_offsets}, then the raw tensor bytes.
+' ---------------------------------------------------------------------------
+SUB OpenSafetensors (path AS STRING)
+    DIM n AS _UNSIGNED _INTEGER64, hdr AS STRING
+    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
+    stFile = FREEFILE
+    OPEN path FOR BINARY AS #stFile
+    GET #stFile, , n
+    hdr = SPACE$(n)
+    GET #stFile, , hdr
+    stDataStart = 8 + n
+    stHeader = JsonParse&(hdr)
+END SUB
+
+' ---------------------------------------------------------------------------
+' LoadTensor: read one tensor into w() starting at destOff.
+'
+' bf16 -> fp32 is exact: a bf16 is the top 16 bits of an fp32 (same sign and
+' 8-bit exponent, 7 of the 23 mantissa bits), so the conversion is a 16-bit
+' left shift. The shifted values are built in an _UNSIGNED LONG array and
+' the raw bytes copied into the SINGLE array with _MEMCOPY.
+'
+' permuteHeads > 0 reorders the rows of a Q or K projection so that, within
+' each head, HuggingFace's RoPE pair (j, j + head_dim/2) becomes the adjacent
+' pair (2j, 2j+1) that run.c's rotation expects: new row 2j = old row j,
+' new row 2j+1 = old row j + head_dim/2. Attention scores are dot products
+' within a head, so permuting q and k rows alike changes no output.
+' ---------------------------------------------------------------------------
+SUB LoadTensor (tname AS STRING, destOff AS LONG, count AS LONG, permuteHeads AS LONG)
+    DIM node AS LONG, shp AS LONG, offs AS LONG, dtype AS STRING
+    DIM n AS LONG, rows AS LONG, cols AS LONG, i AS LONG, r AS LONG, c AS LONG
+    DIM hd AS LONG, half AS LONG, h AS LONG, k AS LONG, rDest AS LONG
+    DIM startByte AS _INTEGER64, endByte AS _INTEGER64
+    DIM src AS _MEM, dst AS _MEM
+
+    node = JsonGet&(stHeader, tname)
+    IF node < 0 THEN Fail "tensor not in safetensors: " + tname
+    dtype = jValue(JsonNeed&(node, "dtype"))
+    shp = JsonNeed&(node, "shape")
+    n = 1: i = JsonFirst&(shp)
+    WHILE i >= 0
+        n = n * JsonNum#(i)
+        i = JsonNext&(i)
+    WEND
+    IF n <> count THEN Fail tname + ": has" + STR$(n) + " elements, expected" + STR$(count)
+    offs = JsonNeed&(node, "data_offsets")
+    startByte = JsonNum#(JsonAt&(offs, 0)): endByte = JsonNum#(JsonAt&(offs, 1))
+
+    REDIM bits(0 TO n - 1) AS _UNSIGNED LONG
+    IF dtype = "BF16" THEN
+        IF endByte - startByte <> 2 * n THEN Fail tname + ": bf16 byte count mismatch"
+        REDIM u16(0 TO n - 1) AS _UNSIGNED INTEGER
+        GET #stFile, stDataStart + startByte + 1, u16()
+        IF permuteHeads = 0 THEN
+            FOR i = 0 TO n - 1
+                bits(i) = u16(i) * 65536~&
+            NEXT
+        ELSE
+            rows = JsonNum#(JsonAt&(shp, 0)): cols = JsonNum#(JsonAt&(shp, 1))
+            hd = rows \ permuteHeads: half = hd \ 2
+            FOR r = 0 TO rows - 1
+                h = r \ hd: k = r MOD hd '           head, row within head
+                rDest = h * hd + 2 * (k MOD half) + k \ half
+                FOR c = 0 TO cols - 1
+                    bits(rDest * cols + c) = u16(r * cols + c) * 65536~&
+                NEXT
+            NEXT
+        END IF
+    ELSEIF dtype = "F32" THEN
+        IF permuteHeads <> 0 THEN Fail "F32 permute not implemented"
+        IF endByte - startByte <> 4 * n THEN Fail tname + ": f32 byte count mismatch"
+        GET #stFile, stDataStart + startByte + 1, bits()
+    ELSE
+        Fail tname + ": unsupported dtype " + dtype
+    END IF
+
+    src = _MEM(bits()): dst = _MEM(w())
+    _MEMCOPY src, src.OFFSET, n * 4 TO dst, dst.OFFSET + destOff * 4
+    _MEMFREE src: _MEMFREE dst
 END SUB

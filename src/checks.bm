@@ -2,9 +2,7 @@
 ' Python oracle (export/oracle.py) can parse and compare.
 
 SUB PrintModelInfo
-    PRINT "weights.bin header"
-    PRINT "  magic        "; cfg.magic
-    PRINT "  version      "; cfg.version
+    PRINT "config.json"
     PRINT "  dim          "; cfg.modelDim
     PRINT "  hidden_dim   "; cfg.hiddenDim
     PRINT "  n_layers     "; cfg.nLayers
@@ -21,11 +19,11 @@ END SUB
 ' Step 1: first and last five floats of the file, with raw bytes.
 SUB PrintWeightCheck
     DIM i AS LONG
-    PRINT "first 5 floats of token_embedding (w(offTokenEmbedding + i)):"
+    PRINT "first 5 weights in memory (token_embedding row 0, w(offTokenEmbedding + i)):"
     FOR i = 0 TO 4
         PRINT "  ["; i; "] "; CDBL(w(offTokenEmbedding + i)); "  hex "; FloatHex$(w(offTokenEmbedding + i))
     NEXT
-    PRINT "last 5 floats of the file (tail of rms_final, w(nParams - 5 + i)):"
+    PRINT "last 5 weights in memory (tail of rms_final, w(nParams - 5 + i)):"
     FOR i = 0 TO 4
         PRINT "  ["; i; "] "; CDBL(w(nParams - 5 + i)); "  hex "; FloatHex$(w(nParams - 5 + i))
     NEXT

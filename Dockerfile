@@ -4,15 +4,16 @@
 #   docker run -it gotoken                                  # the REPL
 #   docker run gotoken complete 32 "Once upon a time"       # one completion
 #
-# Three stages: export the model with Python, build the engine with QB64,
-# then a slim runtime holding just the binary and the two model files.
+# Three stages: fetch the HuggingFace checkpoint, build QB64 and compile the
+# engine, then a slim runtime holding just the binary and the model files.
+# The engine reads the checkpoint directly; there is no conversion step.
 
-# --- 1. export weights.bin + tokenizer.bin from the HuggingFace checkpoint ---
-FROM python:3.11-slim AS export
-RUN pip install --no-cache-dir numpy huggingface_hub tokenizers
-WORKDIR /work
-COPY export/export.py .
-RUN python export.py --out /model
+# --- 1. fetch config.json, model.safetensors, tokenizer.json ----------------
+FROM debian:bookworm-slim AS model
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY fetch-model.sh /fetch-model.sh
+RUN sh /fetch-model.sh /model
 
 # --- 2. build QB64 from its release tarball, then compile the engine ---------
 FROM debian:bookworm-slim AS build
@@ -35,13 +36,14 @@ RUN find . -name "*.sh" -exec chmod +x {} \; \
 WORKDIR /src
 COPY gotoken.bas .
 COPY src ./src
-RUN /opt/qb64/qb64 -x -c /src/gotoken.bas -o /src/gotoken && ldd /src/gotoken
+RUN (/opt/qb64/qb64 -x -c /src/gotoken.bas -o /src/gotoken || (cat /opt/qb64/internal/temp*/compilelog.txt; exit 1)) \
+    && ldd /src/gotoken
 
 # --- 3. runtime: the binary and the model, nothing else ----------------------
 FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=build /src/gotoken /app/gotoken
-COPY --from=export /model/weights.bin /model/tokenizer.bin /app/model/
+COPY --from=model /model/config.json /model/model.safetensors /model/tokenizer.json /app/model/
 # gotoken resolves model/ relative to the directory it is launched from
 ENTRYPOINT ["/app/gotoken"]
 CMD ["repl"]

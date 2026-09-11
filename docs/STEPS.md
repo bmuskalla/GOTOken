@@ -440,3 +440,44 @@ those rows, only how its scores are read.
 **Reserved word this step:** `LINE`. Also: `EOF(0)` blocks forever in
 console mode, so the REPL ends on `/quit` or three empty lines.
 
+
+## Step 0, revisited: the engine reads the checkpoint itself
+
+The export step existed so that the engine could read "the dumbest possible
+file" while it was being built and verified. With the engine finished, the
+intermediate format was retired: `LoadModel` and `LoadTokenizer` now read
+`config.json`, `model.safetensors` and `tokenizer.json` directly, in the
+HuggingFace snapshot layout, and the Python export is gone.
+
+What moved into BASIC (`src/json.bm`, `src/model.bm`, `src/tokenizer.bm`,
+`src/unicode.bm`):
+
+* a small recursive-descent JSON parser (strings with `\uXXXX` escapes and
+  surrogate pairs, numbers, nesting), 250 lines; tokenizer.json's 2 MB
+  parse in 70 ms;
+* the safetensors reader: 8-byte header length, JSON header, tensors read
+  with `GET` at their byte offsets;
+* bf16 to fp32 as a 16-bit left shift into an `_UNSIGNED LONG` array,
+  copied bit for bit into the `SINGLE` weight array with `_MEMCOPY`;
+* the Q/K row permutation for run.c's RoPE pair layout, done per tensor;
+* the inverse of GPT-2's byte-to-unicode alphabet, and merge ranks turned
+  into scores while walking the merges list;
+* the Unicode letter, number and whitespace ranges as string tables.
+
+**Checkpoint.** A temporary `check-export` command loaded the model through
+the new path and compared it against the files the Python export had
+produced: 134,515,008 weights, 49,152 token entries (score and bytes) and
+792 Unicode ranges, every one identical, in 6 seconds including the load.
+The oracle then re-ran the tokenizer corpus and greedy decoding against
+HuggingFace with the new loader, unchanged. Loading takes about 4 seconds
+now instead of 0.5, all of it the bf16 conversion and the tokenizer parse.
+
+**Lesson.** Every engine eventually contains a loader for a format it does
+not control. The reason to do it last is that by then every other piece is
+verified, so when the loader is wrong, the loader is the only suspect, and
+the retired export is a perfect oracle for it.
+
+**Reserved words this time:** `KEY`, `OUT`, `OFF` again. Also: a runtime
+error in a QB64 console program opens a GUI dialog box and blocks; the main
+program now has an `ON ERROR` handler that prints the error and the include
+file and line instead.

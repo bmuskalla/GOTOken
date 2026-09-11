@@ -1,0 +1,258 @@
+' json.bm - recursive-descent JSON parser over jsonText (see json.bi).
+'
+' JsonParse text$ -> root node index. Then:
+'   JsonGet&(node, keyName$)   member of an object by name, -1 if absent
+'   JsonAt&(node, i)       i-th child (0-based) of an array or object
+'   JsonFirst&/JsonNext&   walk children without the O(n) index lookup
+'   JsonNum#(node)         number as DOUBLE
+'   jValue(node)           string bytes (UTF-8), jKey(node) a member's name
+' Strings are decoded: \" \\ \/ \b \f \n \r \t and \uXXXX (surrogate pairs
+' become one 4-byte UTF-8 sequence). Everything else is passed through.
+
+FUNCTION JsonParse& (text AS STRING)
+    DIM root AS LONG
+    jsonText = text
+    jsonPos = 1
+    jsonCount = 0
+    REDIM jType(0 TO 1023) AS LONG, jValue(0 TO 1023) AS STRING, jKey(0 TO 1023) AS STRING
+    REDIM jChild(0 TO 1023) AS LONG, jNext(0 TO 1023) AS LONG, jLen(0 TO 1023) AS LONG
+    root = JsonValue&
+    JsonSkipSpace
+    IF jsonPos <= LEN(jsonText) THEN JsonFail "trailing characters"
+    JsonParse& = root
+END FUNCTION
+
+SUB JsonFail (msg AS STRING)
+    Fail "json: " + msg + " at byte" + STR$(jsonPos) + ": " + MID$(jsonText, jsonPos, 40)
+END SUB
+
+FUNCTION JsonNewNode& (kind AS LONG)
+    DIM n AS LONG
+    IF jsonCount > UBOUND(jType) THEN
+        REDIM _PRESERVE jType(0 TO 2 * jsonCount) AS LONG, jValue(0 TO 2 * jsonCount) AS STRING, jKey(0 TO 2 * jsonCount) AS STRING
+        REDIM _PRESERVE jChild(0 TO 2 * jsonCount) AS LONG, jNext(0 TO 2 * jsonCount) AS LONG, jLen(0 TO 2 * jsonCount) AS LONG
+    END IF
+    n = jsonCount
+    jsonCount = jsonCount + 1
+    jType(n) = kind: jValue(n) = "": jKey(n) = ""
+    jChild(n) = -1: jNext(n) = -1: jLen(n) = 0
+    JsonNewNode& = n
+END FUNCTION
+
+SUB JsonSkipSpace
+    DIM c AS LONG
+    WHILE jsonPos <= LEN(jsonText)
+        c = ASC(jsonText, jsonPos)
+        IF c <> 32 AND c <> 9 AND c <> 10 AND c <> 13 THEN EXIT WHILE
+        jsonPos = jsonPos + 1
+    WEND
+END SUB
+
+SUB JsonExpect (ch AS STRING)
+    JsonSkipSpace
+    IF jsonPos > LEN(jsonText) THEN JsonFail "expected " + ch
+    IF ASC(jsonText, jsonPos) <> ASC(ch) THEN JsonFail "expected " + ch
+    jsonPos = jsonPos + 1
+END SUB
+
+FUNCTION JsonValue&
+    DIM c AS LONG, n AS LONG, start AS LONG
+    JsonSkipSpace
+    IF jsonPos > LEN(jsonText) THEN JsonFail "unexpected end"
+    c = ASC(jsonText, jsonPos)
+    SELECT CASE c
+        CASE 123 ' {
+            n = JsonNewNode&(JSON_OBJECT)
+            jsonPos = jsonPos + 1
+            JsonMembers n, 125
+        CASE 91 ' [
+            n = JsonNewNode&(JSON_ARRAY)
+            jsonPos = jsonPos + 1
+            JsonMembers n, 93
+        CASE 34 ' "
+            n = JsonNewNode&(JSON_STRING)
+            jValue(n) = JsonString$
+        CASE 116 ' true
+            IF MID$(jsonText, jsonPos, 4) <> "true" THEN JsonFail "bad literal"
+            n = JsonNewNode&(JSON_BOOL): jValue(n) = "1": jsonPos = jsonPos + 4
+        CASE 102 ' false
+            IF MID$(jsonText, jsonPos, 5) <> "false" THEN JsonFail "bad literal"
+            n = JsonNewNode&(JSON_BOOL): jValue(n) = "0": jsonPos = jsonPos + 5
+        CASE 110 ' null
+            IF MID$(jsonText, jsonPos, 4) <> "null" THEN JsonFail "bad literal"
+            n = JsonNewNode&(JSON_NULL): jsonPos = jsonPos + 4
+        CASE 45, 48 TO 57 ' number
+            n = JsonNewNode&(JSON_NUMBER)
+            start = jsonPos
+            WHILE jsonPos <= LEN(jsonText)
+                c = ASC(jsonText, jsonPos)
+                IF (c >= 48 AND c <= 57) OR c = 45 OR c = 43 OR c = 46 OR c = 101 OR c = 69 THEN jsonPos = jsonPos + 1 ELSE EXIT WHILE
+            WEND
+            jValue(n) = MID$(jsonText, start, jsonPos - start)
+        CASE ELSE
+            JsonFail "unexpected character"
+    END SELECT
+    JsonValue& = n
+END FUNCTION
+
+' children of an object (closer = "}") or array (closer = "]")
+SUB JsonMembers (node AS LONG, closer AS LONG)
+    DIM child AS LONG, last AS LONG, keyName AS STRING
+    last = -1
+    JsonSkipSpace
+    IF jsonPos <= LEN(jsonText) THEN
+        IF ASC(jsonText, jsonPos) = closer THEN jsonPos = jsonPos + 1: EXIT SUB
+    END IF
+    DO
+        IF closer = 125 THEN
+            JsonSkipSpace
+            keyName = JsonString$
+            JsonExpect ":"
+        END IF
+        child = JsonValue&
+        IF closer = 125 THEN jKey(child) = keyName
+        IF last < 0 THEN jChild(node) = child ELSE jNext(last) = child
+        last = child
+        jLen(node) = jLen(node) + 1
+        JsonSkipSpace
+        IF jsonPos > LEN(jsonText) THEN JsonFail "unterminated container"
+        IF ASC(jsonText, jsonPos) = 44 THEN ' ,
+            jsonPos = jsonPos + 1
+        ELSEIF ASC(jsonText, jsonPos) = closer THEN
+            jsonPos = jsonPos + 1
+            EXIT DO
+        ELSE
+            JsonFail "expected , or closer"
+        END IF
+    LOOP
+END SUB
+
+' a quoted string at jsonPos, decoded to UTF-8 bytes
+FUNCTION JsonString$
+    DIM start AS LONG, i AS LONG, c AS LONG, s AS STRING, cp AS LONG, lo AS LONG
+    IF jsonPos > LEN(jsonText) THEN JsonFail "expected string"
+    IF ASC(jsonText, jsonPos) <> 34 THEN JsonFail "expected string"
+    jsonPos = jsonPos + 1
+    ' fast path: no escapes before the closing quote
+    i = jsonPos
+    WHILE i <= LEN(jsonText)
+        c = ASC(jsonText, i)
+        IF c = 34 THEN
+            JsonString$ = MID$(jsonText, jsonPos, i - jsonPos)
+            jsonPos = i + 1
+            EXIT FUNCTION
+        END IF
+        IF c = 92 THEN EXIT WHILE
+        i = i + 1
+    WEND
+    ' slow path: build with escapes decoded
+    s = MID$(jsonText, jsonPos, i - jsonPos)
+    jsonPos = i
+    WHILE jsonPos <= LEN(jsonText)
+        c = ASC(jsonText, jsonPos)
+        IF c = 34 THEN jsonPos = jsonPos + 1: JsonString$ = s: EXIT FUNCTION
+        IF c = 92 THEN
+            jsonPos = jsonPos + 1
+            c = ASC(jsonText, jsonPos)
+            SELECT CASE c
+                CASE 34, 92, 47: s = s + CHR$(c)
+                CASE 98: s = s + CHR$(8)
+                CASE 102: s = s + CHR$(12)
+                CASE 110: s = s + CHR$(10)
+                CASE 114: s = s + CHR$(13)
+                CASE 116: s = s + CHR$(9)
+                CASE 117 ' \uXXXX
+                    cp = VAL("&H" + MID$(jsonText, jsonPos + 1, 4))
+                    jsonPos = jsonPos + 4
+                    IF cp >= &HD800 AND cp <= &HDBFF THEN ' high surrogate: a \uDC00-DFFF must follow
+                        IF MID$(jsonText, jsonPos + 1, 2) = "\u" THEN
+                            lo = VAL("&H" + MID$(jsonText, jsonPos + 3, 4))
+                            cp = &H10000 + (cp - &HD800) * 1024 + (lo - &HDC00)
+                            jsonPos = jsonPos + 6
+                        END IF
+                    END IF
+                    s = s + Utf8$(cp)
+                CASE ELSE: JsonFail "bad escape"
+            END SELECT
+            jsonPos = jsonPos + 1
+        ELSE
+            s = s + CHR$(c)
+            jsonPos = jsonPos + 1
+        END IF
+    WEND
+    JsonFail "unterminated string"
+END FUNCTION
+
+' codepoint -> UTF-8 bytes
+FUNCTION Utf8$ (cp AS LONG)
+    IF cp < 128 THEN
+        Utf8$ = CHR$(cp)
+    ELSEIF cp < 2048 THEN
+        Utf8$ = CHR$(192 + cp \ 64) + CHR$(128 + (cp AND 63))
+    ELSEIF cp < 65536 THEN
+        Utf8$ = CHR$(224 + cp \ 4096) + CHR$(128 + ((cp \ 64) AND 63)) + CHR$(128 + (cp AND 63))
+    ELSE
+        Utf8$ = CHR$(240 + cp \ 262144) + CHR$(128 + ((cp \ 4096) AND 63)) + CHR$(128 + ((cp \ 64) AND 63)) + CHR$(128 + (cp AND 63))
+    END IF
+END FUNCTION
+
+' --- access ------------------------------------------------------------------
+FUNCTION JsonGet& (node AS LONG, keyName AS STRING)
+    DIM c AS LONG
+    IF node < 0 THEN JsonGet& = -1: EXIT FUNCTION
+    c = jChild(node)
+    WHILE c >= 0
+        IF jKey(c) = keyName THEN JsonGet& = c: EXIT FUNCTION
+        c = jNext(c)
+    WEND
+    JsonGet& = -1
+END FUNCTION
+
+' like JsonGet but fails loudly when the member is missing
+FUNCTION JsonNeed& (node AS LONG, keyName AS STRING)
+    DIM c AS LONG
+    c = JsonGet&(node, keyName)
+    IF c < 0 THEN Fail "json: missing keyName " + keyName
+    JsonNeed& = c
+END FUNCTION
+
+FUNCTION JsonAt& (node AS LONG, i AS LONG)
+    DIM c AS LONG, k AS LONG
+    c = jChild(node)
+    FOR k = 1 TO i
+        IF c < 0 THEN EXIT FOR
+        c = jNext(c)
+    NEXT
+    JsonAt& = c
+END FUNCTION
+
+FUNCTION JsonFirst& (node AS LONG)
+    JsonFirst& = jChild(node)
+END FUNCTION
+
+FUNCTION JsonNext& (node AS LONG)
+    JsonNext& = jNext(node)
+END FUNCTION
+
+FUNCTION JsonNum# (node AS LONG)
+    IF node < 0 THEN Fail "json: number expected"
+    IF jType(node) = JSON_NUMBER THEN
+        JsonNum# = VAL(jValue(node))
+    ELSEIF jType(node) = JSON_BOOL THEN
+        JsonNum# = VAL(jValue(node))
+    ELSE
+        Fail "json: number expected, got " + jKey(node) + " = " + jValue(node)
+    END IF
+END FUNCTION
+
+' read a whole file into a string
+FUNCTION ReadFile$ (path AS STRING)
+    DIM f AS LONG, s AS STRING
+    IF NOT _FILEEXISTS(path) THEN Fail "no such file: " + path
+    f = FREEFILE
+    OPEN path FOR BINARY AS #f
+    s = SPACE$(LOF(f))
+    IF LOF(f) > 0 THEN GET #f, , s
+    CLOSE #f
+    ReadFile$ = s
+END FUNCTION

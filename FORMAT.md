@@ -1,167 +1,153 @@
-# Binary formats
+# Model loading and memory layout
 
-Both files are produced by `export/export.py`. Everything is little-endian.
-The BASIC side never parses anything cleverer than a stream of 4-byte
-INT32/SINGLE values followed by raw bytes.
+The engine reads the HuggingFace checkpoint directly. A model directory
+holds three files in the HuggingFace snapshot layout:
 
-## weights.bin
+    config.json          the shape: dims, layers, heads, vocab, rope_theta, eps
+    model.safetensors    the weights, bf16, 269 MB
+    tokenizer.json       the byte-level BPE vocab and merge rules
 
-### Header (48 bytes)
+`fetch-model.sh` downloads them. This document describes what the loader
+(`src/model.bm`, `src/tokenizer.bm`) makes of them and how the result is
+laid out in memory, which is what the rest of the engine sees.
 
-| offset | field          | type    | SmolLM2-135M |
-|-------:|----------------|---------|-------------:|
-|      0 | magic          | INT32   | 1263490119 (`b"GTOK"`) |
-|      4 | version        | INT32   | 1 |
-|      8 | dim            | INT32   | 576 |
-|     12 | hidden_dim     | INT32   | 1536 |
-|     16 | n_layers       | INT32   | 30 |
-|     20 | n_heads        | INT32   | 9 |
-|     24 | n_kv_heads     | INT32   | 3 |
-|     28 | vocab_size     | INT32   | 49152 |
-|     32 | seq_len        | INT32   | 8192 |
-|     36 | tied           | INT32   | 1 |
-|     40 | rope_theta     | SINGLE  | 100000.0 |
-|     44 | rms_norm_eps   | SINGLE  | 1e-5 |
+## config.json
 
-Every value is read from `config.json` at export time. The two SINGLE fields
-exist because SmolLM2 does not use llama2.c's defaults: `rope_theta` is
-100000, not 10000. Hardcoding 10000 would produce plausible-looking garbage
-from step 4 onward.
+| key                      | field           | SmolLM2-135M |
+|--------------------------|-----------------|-------------:|
+| hidden_size              | dim             | 576 |
+| intermediate_size        | hidden_dim      | 1536 |
+| num_hidden_layers        | n_layers        | 30 |
+| num_attention_heads      | n_heads         | 9 |
+| num_key_value_heads      | n_kv_heads      | 3 |
+| vocab_size               | vocab_size      | 49152 |
+| max_position_embeddings  | seq_len         | 8192 |
+| tie_word_embeddings      | tied            | true |
+| rope_theta               | rope_theta      | 100000 |
+| rms_norm_eps             | rms_norm_eps    | 1e-5 |
 
-`seq_len` is the model's trained context. The engine may allocate a smaller
-KV cache.
+`model_type` must be `llama`, `hidden_act` must be `silu`, `rope_scaling`
+must be null. Note `rope_theta`: llama2.c hardcodes 10000; using that here
+would produce plausible-looking garbage.
 
-Derived values the loader will need:
+Derived values:
 
     head_dim = dim / n_heads              = 64
     kv_dim   = n_kv_heads * head_dim      = 192
     kv_mul   = n_heads / n_kv_heads       = 3   (query heads per KV head)
 
-### Weight blobs (fp32, in this order, no padding)
+`seq_len` is the model's trained context. The engine allocates a smaller
+KV cache (`maxSeq` in `src/forward.bm`, 1024).
 
-| blob             | shape            | floats     |
-|------------------|------------------|-----------:|
-| token_embedding  | [vocab, dim]     | 28,311,552 |
-| per layer, 30 times: |              |            |
-| &nbsp;&nbsp;rms_att | [dim]         | 576 |
-| &nbsp;&nbsp;wq      | [dim, dim]    | 331,776 |
-| &nbsp;&nbsp;wk      | [kv_dim, dim] | 110,592 |
-| &nbsp;&nbsp;wv      | [kv_dim, dim] | 110,592 |
-| &nbsp;&nbsp;wo      | [dim, dim]    | 331,776 |
-| &nbsp;&nbsp;rms_ffn | [dim]         | 576 |
-| &nbsp;&nbsp;w1 (gate) | [hidden, dim] | 884,736 |
-| &nbsp;&nbsp;w2 (down) | [dim, hidden] | 884,736 |
-| &nbsp;&nbsp;w3 (up)   | [hidden, dim] | 884,736 |
-| rms_final        | [dim]            | 576 |
-| wcls             | [vocab, dim]     | only if tied == 0 (absent here) |
+## model.safetensors
 
-Total: 134,515,008 floats, 538,060,032 bytes of weights, file size 538,060,080.
+An 8-byte little-endian header length, a JSON header mapping each tensor
+name to `{dtype, shape, data_offsets}`, then the raw tensor bytes. The
+loader parses the header with the engine's own JSON parser and reads each
+tensor with a `GET` at its offset.
 
-Mapping from HuggingFace names: `input_layernorm` = rms_att, `q/k/v/o_proj` =
-wq/wk/wv/wo, `post_attention_layernorm` = rms_ffn, `gate_proj` = w1,
-`down_proj` = w2, `up_proj` = w3, `model.norm` = rms_final. The w1/w2/w3
-naming follows llama2.c so the BASIC FFN reads the same as `run.c`:
-`w2( silu(w1 x) * (w3 x) )`.
+**bf16 to fp32** is exact: a bf16 is the top 16 bits of an fp32 (same sign
+and 8-bit exponent, 7 of the 23 mantissa bits). The loader reads the tensor
+as 16-bit integers, shifts each left by 16 into an `_UNSIGNED LONG` array,
+and copies the bytes into the `SINGLE` weight array with `_MEMCOPY`. The
+low two bytes of every weight are zero.
 
-Unlike llama2.c, blobs are interleaved per layer rather than grouped by kind.
-The loader reads layer 0 completely, then layer 1, and so on.
+### Memory layout
+
+All weights live in one flat `SINGLE` array `w()`, and each tensor has a
+`LONG` start offset (`offWq(l)` and so on). This is run.c's
+`memory_map_weights` with pointers replaced by integers. Tensors are placed
+in this order, interleaved per layer:
+
+| tensor           | HF name                    | shape            | floats     |
+|------------------|----------------------------|------------------|-----------:|
+| token_embedding  | model.embed_tokens.weight  | [vocab, dim]     | 28,311,552 |
+| per layer, 30 times: |                        |                  |            |
+| &nbsp;&nbsp;rms_att | input_layernorm.weight  | [dim]            | 576 |
+| &nbsp;&nbsp;wq      | self_attn.q_proj.weight | [dim, dim]       | 331,776 |
+| &nbsp;&nbsp;wk      | self_attn.k_proj.weight | [kv_dim, dim]    | 110,592 |
+| &nbsp;&nbsp;wv      | self_attn.v_proj.weight | [kv_dim, dim]    | 110,592 |
+| &nbsp;&nbsp;wo      | self_attn.o_proj.weight | [dim, dim]       | 331,776 |
+| &nbsp;&nbsp;rms_ffn | post_attention_layernorm.weight | [dim]    | 576 |
+| &nbsp;&nbsp;w1 (gate) | mlp.gate_proj.weight  | [hidden, dim]    | 884,736 |
+| &nbsp;&nbsp;w2 (down) | mlp.down_proj.weight  | [dim, hidden]    | 884,736 |
+| &nbsp;&nbsp;w3 (up)   | mlp.up_proj.weight    | [hidden, dim]    | 884,736 |
+| rms_final        | model.norm.weight          | [dim]            | 576 |
+| wcls             | lm_head.weight             | [vocab, dim]     | only if not tied; here wcls = token_embedding |
+
+Total: 134,515,008 floats, 538 MB. The w1/w2/w3 naming follows llama2.c so
+the FFN reads like `run.c`: `w2( silu(w1 x) * (w3 x) )`.
 
 ### Matrix layout
 
 Every matrix is stored **row-major with shape [out, in]**, exactly as
 HuggingFace stores `nn.Linear` weights and exactly as `run.c` expects:
 
-    y[o] = sum over i of  W[o*in + i] * x[i]
+    y[o] = sum over i of  w(p + o*in + i) * x[i]
 
-The inner loop over `i` walks memory contiguously. No transposition is applied
-at export; the "pre-transposed" requirement is met by the fact that the HF
-layout already is the layout a dot-product-per-output-row matmul wants.
-
-For a 1D BASIC array this is a direct `GET`. For a 2D array note that QB64
-stores the **first** subscript fastest, so the natural declaration is
-`DIM w(0 TO in - 1, 0 TO out - 1)` and the element is `w(i, o)`. Step 1
-verifies whichever choice is made.
+for a matrix starting at offset `p`. The inner loop walks memory
+contiguously. No transposition is needed.
 
 ### Q/K row permutation (RoPE convention)
 
-HuggingFace applies RoPE with `rotate_half`: within each head the rotated pair
-is `(j, j + head_dim/2)`. llama2.c rotates adjacent pairs `(2j, 2j+1)`. To keep
-the BASIC RoPE identical to `run.c`, the exporter reorders the output rows of
-`wq` and `wk` per head (llama2.c's `permute_reverse`):
+HuggingFace applies RoPE with `rotate_half`: within each head the rotated
+pair is `(j, j + head_dim/2)`. llama2.c rotates adjacent pairs `(2j, 2j+1)`.
+To keep the BASIC RoPE identical to `run.c`, the loader reorders the rows of
+`wq` and `wk` per head as it converts them (llama2.c's `permute_reverse`):
 
     new row 2j     = old row j
     new row 2j + 1 = old row j + head_dim/2
 
-Attention scores are per-head dot products, which are invariant under a
-permutation applied to both q and k, so every layer output and every logit
-stays bit-identical to HuggingFace. Only the raw `q_proj` / `k_proj` outputs
-differ from a forward hook by this permutation. The exporter checks this
-numerically on layer 0 every run.
+Attention scores are per-head dot products, invariant under a permutation
+applied to both q and k, so every layer output and every logit stays
+identical to HuggingFace. Only the raw q and k vectors differ from a
+`q_proj` / `k_proj` forward hook by this permutation.
 
-## tokenizer.bin
+## tokenizer.json
 
-    INT32  vocab_size            49152
-    INT32  max_token_length      81   (bytes; size your read buffer with this)
-    repeated vocab_size times, in token-id order:
-        SINGLE score
-        INT32  length
-        BYTE[length] raw UTF-8 bytes of the token
+The `model.vocab` object maps token strings to ids and `model.merges` lists
+the merge rules in rank order. Both are written in GPT-2's byte-level
+alphabet: each character stands for one byte, printable Latin-1 characters
+for themselves and the 68 others (controls, space, 0x7f to 0xa0, 0xad) for
+codepoints U+0100 and up, so a space appears as `Ġ`. The loader inverts
+that map to get raw bytes, which is what the engine tokenizes.
 
-    then three Unicode character classes, each as sorted inclusive
-    codepoint ranges:
-        INT32  count
-        INT32  lo, INT32 hi      (count times)
-    in the order  L (letters, Unicode L*: 648 ranges),
-                  N (numbers, N*: 134 ranges),
-                  WS (whitespace, the White_Space property: 10 ranges)
+In memory:
 
-This is the llama2.c `tokenizer.bin` scheme with the vocab size prepended,
-plus the class tables the GPT-2 pre-tokenizer regex needs for `\p{L}`,
-`\p{N}` and `\s`. Shipping them as ranges lets the engine classify a
-codepoint with a binary search instead of carrying a Unicode database.
+* `tokStr(id)`: the token's bytes. `added_tokens` (the 17 specials, ids 0
+  to 16; `<|endoftext|>` is id 0 and serves as BOS and EOS) are literal
+  text, not byte-level encoded.
+* `tokScore(id)`: `-rank` of the merge rule that produces the token, so
+  llama2.c's "merge the best-scoring adjacent pair" loop reproduces GPT-2's
+  rank order; `-1e30` for the 235 byte tokens and the specials, which no
+  merge produces. Every one of the 48900 rules maps to exactly one token.
+* `byteId(b)`: the id of the single-byte token for byte `b`, or -1. 21 byte
+  values have no token (`0x04 0x06 0x13 0x14 0x16 0x1d 0xc0 0xc1 0xf1 0xf2
+  0xf5..0xff`); they cannot appear in UTF-8 training text. HuggingFace drops
+  such bytes silently and so does the engine.
+* a hash table from bytes to id (FNV-1a, linear probing).
+* the codepoint ranges for `\p{L}` (648), `\p{N}` (134) and `\s` (10, the
+  Unicode White_Space property) from `src/unicode.bm`, for the GPT-2
+  pre-tokenizer regex.
 
-* Bytes are real bytes. The GPT-2 byte-to-unicode trick used inside
-  `tokenizer.json` (space shown as `Ġ`, etc.) is undone at export.
-* Scores emulate GPT-2 merge ranks for llama2.c's "merge the best-scoring
-  adjacent pair" loop: a token produced by merge rule number `r` has
-  `score = -r`, so lower rank wins as the highest score. Every one of the
-  48900 merge rules maps to exactly one token.
-* Tokens that no merge produces (the 235 single-byte tokens and the 17
-  special tokens, ids 0 to 16) have `score = -1e30`. The encoder must never
-  merge into them.
-* `<|endoftext|>` is id 0 and serves as both BOS and EOS.
-* The pre-tokenizer is the GPT-2 regex alone. `tokenizer.json` also lists
-  a `Digits(individual_digits)` step, but no merge rule and no multi-char
-  token contains a numeric character, so digits come out one token each
-  either way, and transformers 5 drops the step when loading.
-* 21 byte values have no token at all: `0x04 0x06 0x13 0x14 0x16 0x1d 0xc0
-  0xc1 0xf1 0xf2 0xf5..0xff`. They cannot appear in the UTF-8 training data.
-  HuggingFace drops such bytes silently; the byte fallback in step 7 does the
-  same.
+The pre-tokenizer is the GPT-2 regex alone. `tokenizer.json` also lists a
+`Digits(individual_digits)` step, but no merge rule and no multi-character
+token contains a numeric character, so digits come out one token each
+either way, and transformers 5 drops the step when loading.
 
-## Step 1 checkpoint values
+## Reference values
 
-First 5 floats of `token_embedding` (row 0), as stored:
+For a quick sanity check, `gotoken info` prints the first and last five
+weights in memory. Expected, as fp32 with the bytes in memory order:
 
-| index | value            | bytes on disk |
-|------:|------------------|---------------|
-| 0     | -0.11767578125   | `00 00 f1 bd` |
-| 1     |  0.02783203125   | `00 00 e4 3c` |
-| 2     |  0.048095703125  | `00 00 45 3d` |
-| 3     | -0.0079345703125 | `00 00 02 bc` |
-| 4     | -0.05615234375   | `00 00 66 bd` |
+| weight | value | bytes |
+|---|---|---|
+| w(0), embedding row 0 | -0.11767578125 | `00 00 f1 bd` |
+| w(1) | 0.02783203125 | `00 00 e4 3c` |
+| w(2) | 0.048095703125 | `00 00 45 3d` |
+| w(3) | -0.0079345703125 | `00 00 02 bc` |
+| w(4) | -0.05615234375 | `00 00 66 bd` |
+| w(n-5) .. w(n-1), tail of rms_final | 2.28125, 1.90625, 1.8671875, 1.90625, 1.984375 | `00 00 12 40` ... `00 00 fe 3f` |
 
-Last 5 floats of the file (tail of `rms_final`):
-
-| index | value      | bytes on disk |
-|------:|------------|---------------|
-| 0     | 2.28125    | `00 00 12 40` |
-| 1     | 1.90625    | `00 00 f4 3f` |
-| 2     | 1.8671875  | `00 00 ef 3f` |
-| 3     | 1.90625    | `00 00 f4 3f` |
-| 4     | 1.984375   | `00 00 fe 3f` |
-
-The head proves the header offset is right; the tail proves every blob size
-in between was added up correctly. The low two bytes are always zero: the
-checkpoint is bf16, and bf16 to fp32 just pads the mantissa with 16 zero
-bits, so the conversion is exact.
+The head proves the first tensor landed at offset 0; the tail proves every
+tensor size in between was added up correctly.
