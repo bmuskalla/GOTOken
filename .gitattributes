@@ -1,0 +1,5 @@
+# QB64 include files: declarations (.bi) and subs/functions (.bm). Linguist
+# knows .bas and .bi as QuickBASIC but not .bm, which holds most of the engine.
+*.bm linguist-language=QuickBASIC
+*.bi linguist-language=QuickBASIC
+*.bas linguist-language=QuickBASIC
