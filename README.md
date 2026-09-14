@@ -7,6 +7,9 @@ tokens as HuggingFace `transformers` does. It reads the HuggingFace
 checkpoint files directly: from `config.json`, `model.safetensors` and
 `tokenizer.json` to generated text, everything is BASIC.
 
+<img width="880" height="684" alt="qb_inference" src="https://github.com/user-attachments/assets/33a150ac-e9a9-4855-a706-24a28be7322b" />
+
+
 ```
 $ docker run -it gotoken
 GOTOken: SmolLM2-135M in BASIC. Type a prompt and press enter; /quit to leave.
