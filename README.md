@@ -23,7 +23,8 @@ flowers. One day, Oscar had an idea - why not start a nonprofit organization?
 It is a learning project: the whole engine is about 1500 lines of BASIC that
 map almost one to one onto karpathy's [llama2.c](https://github.com/karpathy/llama2.c),
 and every piece was verified numerically against the real model before the
-next was added.
+next was added. The story of how it came together is in the blog post
+[GOTOken: an inference engine in QBasic](https://bmuskalla.dev/blog/2026-09-13-gotoken-inference-engine-in-qbasic/).
 
 Two halves. Loading turns the checkpoint files into one flat weight array
 and the tokenizer's tables:
